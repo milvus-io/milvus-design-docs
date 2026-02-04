@@ -1,19 +1,8 @@
-# MEP: Channel Exclusive Mode for QueryCoord
+# Channel Exclusive Mode Design Document
 
-- **Created:** 2026-02-04
-- **Author(s):** @wei-liu
-- **Status:** Draft
-- **Component:** QueryCoord
-- **Related Issues:** #47500, #47505
-- **Released:** 2.6.0
+## 1. Background and Motivation
 
-## Summary
-
-Channel Exclusive Mode is a channel-centric load balancing strategy for Milvus QueryCoord that assigns each channel exclusively to a dedicated set of QueryNodes. This design document describes the architecture, data structures, and implementation details of channel exclusive mode enabled by default in Milvus 2.6.
-
-## Motivation
-
-### Problem Statement
+### 1.1 Problem Statement
 
 In Milvus QueryCoord, the traditional load balancing strategy distributes channels and segments across QueryNodes without strict isolation. This approach can lead to several issues:
 
@@ -22,7 +11,7 @@ In Milvus QueryCoord, the traditional load balancing strategy distributes channe
 - **Scalability Challenges**: As the number of channels grows, fine-grained control over channel-to-node mapping becomes difficult
 - **Isolation Requirements**: Some use cases require strict isolation between channels for performance guarantees or fault isolation
 
-### Goals
+### 1.2 Goals
 
 **Channel Exclusive Mode** aims to address these challenges by introducing a channel-centric load balancing strategy with the following goals:
 
@@ -32,7 +21,9 @@ In Milvus QueryCoord, the traditional load balancing strategy distributes channe
 4. **Backward Compatibility**: Gracefully fall back to traditional balancing when exclusivity constraints cannot be met
 5. **Dynamic Adaptation**: Automatically enable or disable exclusive mode based on cluster state and configuration
 
-## Design Details
+---
+
+## 2. Architecture Overview
 
 ### 2.1 High-Level Design
 
@@ -84,9 +75,11 @@ Channel Exclusive Mode is implemented as an extension to Milvus QueryCoord's bal
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 3. Core Data Structures
+---
 
-#### 3.1 ChannelNodeInfo (Proto)
+## 3. Core Data Structures
+
+### 3.1 ChannelNodeInfo (Proto)
 
 **File**: `pkg/proto/query_coord.proto`
 
@@ -112,7 +105,7 @@ message Replica {
 - **Separate RW/RO Tracking**: Distinguishes between read-write and read-only nodes for different load patterns
 - **Streaming Support**: Includes separate fields for streaming query nodes to support future streaming workloads
 
-#### 3.2 Replica (Immutable)
+### 3.2 Replica (Immutable)
 
 **File**: `internal/querycoordv2/meta/replica.go`
 
@@ -137,7 +130,7 @@ type Replica struct {
 - **UniqueSet**: Ensures no duplicate nodes in the replica
 - **COW Pattern**: Modifications create new instances rather than mutating in-place
 
-#### 3.3 mutableReplica (Copy-on-Write)
+### 3.3 mutableReplica (Copy-on-Write)
 
 ```go
 type mutableReplica struct {
@@ -157,9 +150,11 @@ type mutableReplica struct {
 - **Transient State**: Reverse mapping is only maintained during mutations, not persisted
 - **Explicit Conversion**: `IntoReplica()` enforces intentional conversion back to immutable state
 
-### 4. Channel Exclusive Mode Lifecycle
+---
 
-#### 4.1 Activation Conditions
+## 4. Channel Exclusive Mode Lifecycle
+
+### 4.1 Activation Conditions
 
 Channel exclusive mode is activated when **all** of the following conditions are met:
 
@@ -182,7 +177,7 @@ func shouldEnableChannelExclusiveMode(channelInfos map[string]*querypb.ChannelNo
 }
 ```
 
-#### 4.2 Initialization Flow
+### 4.2 Initialization Flow
 
 **Scenario 1: New Collection Load**
 
@@ -217,11 +212,11 @@ For each replica:
     └─ Continue monitoring
 ```
 
-#### 4.3 Node Assignment Algorithm
+### 4.3 Node Assignment Algorithm
 
 **Location**: `replica.go:409-575`
 
-##### 4.3.1 Calculate Optimal Assignments
+#### 4.3.1 Calculate Optimal Assignments
 
 **Goal**: Distribute nodes evenly across channels
 
@@ -245,7 +240,7 @@ func calculateOptimalAssignments(totalNodes, channelCount int) map[string]int {
 - 7 nodes, 3 channels → `[3, 2, 2]` (first channel gets extra node)
 - 6 nodes, 3 channels → `[2, 2, 2]` (even distribution)
 
-##### 4.3.2 Rebalance Channel Nodes
+#### 4.3.2 Rebalance Channel Nodes
 
 **Two-Phase Process**:
 
@@ -301,9 +296,11 @@ func allocateInsufficientNodes(targetAssignments map[string]int) {
 
 **Allocation Order**: Channels are sorted by current node count (ascending) to prioritize under-allocated channels
 
-### 5. ChannelLevelScoreBalancer
+---
 
-#### 5.1 Design Philosophy
+## 5. ChannelLevelScoreBalancer
+
+### 5.1 Design Philosophy
 
 The `ChannelLevelScoreBalancer` extends the traditional `ScoreBasedBalancer` with channel-awareness:
 
@@ -320,7 +317,7 @@ type ChannelLevelScoreBalancer struct {
 }
 ```
 
-#### 5.2 BalanceReplica Logic
+### 5.2 BalanceReplica Logic
 
 **High-Level Flow** (`channel_level_score_balancer.go:69-160`):
 
@@ -353,9 +350,9 @@ BalanceReplica(ctx, replica)
     └─ (segmentPlans, channelPlans)
 ```
 
-#### 5.3 Balancing Strategies
+### 5.3 Balancing Strategies
 
-##### 5.3.1 Channel Balancing (`genChannelPlan`)
+#### 5.3.1 Channel Balancing (`genChannelPlan`)
 
 **Goal**: Distribute channels evenly across online nodes
 
@@ -380,7 +377,7 @@ BalanceReplica(ctx, replica)
 - Current: `[4, 1, 1]` → Move 2 channels from node 0 → nodes 1 and 2
 - Result: `[2, 2, 2]`
 
-##### 5.3.2 Segment Balancing (`genSegmentPlan`)
+#### 5.3.2 Segment Balancing (`genSegmentPlan`)
 
 **Goal**: Balance segment load within a channel's exclusive node group
 
@@ -403,7 +400,7 @@ BalanceReplica(ctx, replica)
 score = α * CPU% + β * Memory% + γ * DelegatorScore
 ```
 
-##### 5.3.3 Outbound Node Handling
+#### 5.3.3 Outbound Node Handling
 
 **Outbound Node**: A node that was previously assigned to a channel but is no longer in the channel's RW node list (due to node removal or rebalancing)
 
@@ -446,9 +443,11 @@ Similar logic but for segments:
 3. Create SegmentPlan for each segment
 ```
 
-### 6. Configuration Parameters
+---
 
-#### 6.1 Key Parameters
+## 6. Configuration Parameters
+
+### 6.1 Key Parameters
 
 **File**: `pkg/util/paramtable/component_param.go`
 
@@ -458,9 +457,9 @@ Similar logic but for segments:
 | `ChannelExclusiveNodeFactor` | `queryCoord.channelExclusiveNodeFactor` | `"1"` | 2.4.2+ | Minimum nodes per channel to enable exclusive mode |
 | `AutoBalanceChannel` | `queryCoord.autoBalanceChannel` | `false` | 2.3+ | Whether to auto-rebalance channels (inherited from parent) |
 
-#### 6.2 Configuration Examples
+### 6.2 Configuration Examples
 
-##### Example 1: Default (1 node per channel)
+#### Example 1: Default (1 node per channel)
 
 ```yaml
 queryCoord:
@@ -472,7 +471,7 @@ queryCoord:
 - Collection with 4 channels + 4 RW nodes → Exclusive mode enabled (1 node per channel)
 - Collection with 4 channels + 3 RW nodes → Exclusive mode disabled (insufficient nodes)
 
-##### Example 2: High Isolation (2 nodes per channel)
+#### Example 2: High Isolation (2 nodes per channel)
 
 ```yaml
 queryCoord:
@@ -484,7 +483,7 @@ queryCoord:
 - Collection with 4 channels + 8 RW nodes → Exclusive mode enabled (2 nodes per channel)
 - Collection with 4 channels + 7 RW nodes → Exclusive mode disabled (insufficient nodes)
 
-##### Example 3: Disable Exclusive Mode
+#### Example 3: Disable Exclusive Mode
 
 ```yaml
 queryCoord:
@@ -494,9 +493,11 @@ queryCoord:
 **Behavior**:
 - All replicas use segment-level balancing regardless of node count
 
-### 7. Complete Data Flow Example
+---
 
-#### 7.1 Collection Load with Exclusive Mode
+## 7. Complete Data Flow Example
+
+### 7.1 Collection Load with Exclusive Mode
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -595,7 +596,7 @@ queryCoord:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-#### 7.2 Node Removal Scenario
+### 7.2 Node Removal Scenario
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -662,7 +663,9 @@ queryCoord:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Compatibility, Deprecation, and Migration Plan
+---
+
+## 8. Migration and Rollback
 
 > **⚠️ WARNING: Performance Impact**
 >
@@ -826,61 +829,31 @@ After Upgrade (all nodes upgraded):
 > - Total impact time: **20 min to 60min** depending on cluster size
 > - Plan for **sustained high CPU/memory/I/O** during this period
 
-## Test Plan
+---
 
-Channel Exclusive Mode is implemented with comprehensive testing across multiple levels:
+## 9. Conclusion
 
-### Unit Tests
-- **Replica Logic** (`internal/querycoordv2/meta/replica_test.go`):
-  - Channel node assignment algorithm
-  - Exclusive mode enable/disable transitions
-  - Node rebalancing on node removal
-  - Configuration threshold checks
+Channel Exclusive Mode enhances Milvus's query coordination by introducing channel-level resource isolation. Each channel is assigned to a dedicated set of QueryNodes, preventing resource contention and improving performance predictability.
 
-- **ChannelLevelScoreBalancer** (`internal/querycoordv2/balance/channel_level_score_balancer_test.go`):
-  - Channel and segment plan generation
-  - Outbound node detection and handling
-  - Fallback to segment-level balancing
-  - Score calculation and node selection
+**Key Advantages**:
+- Better resource isolation between channels
+- Predictable performance for individual channels
+- Reduced blast radius when one channel experiences high load
+- Backward compatible with existing deployments
+- Automatically enables/disables based on cluster state
 
-- **ReplicaObserver** (`internal/querycoordv2/observers/replica_observer_test.go`):
-  - Dynamic enable/disable on configuration change
-  - RO node cleanup
-  - Periodic monitoring and state updates
+**Important Considerations**:
+- Requires sufficient nodes: `totalNodes >= channels * channelExclusiveNodeFactor`
+- Temporary distribution violations during rolling upgrades (automatically restored afterward)
+- Higher resource usage during mode transitions (50-80% CPU spike, 2x memory temporarily)
+- Runtime-refreshable configuration: no service restart required for enable/disable
 
-### Integration Tests
-- **End-to-End Scenarios** (`tests/integration/balance/channel_exclusive_balance_test.go`):
-  - Collection load with sufficient/insufficient nodes
-  - Node removal and recovery
-  - Configuration changes and mode transitions
-  - Rolling upgrade scenarios
+**Production Readiness**:
+Channel Exclusive Mode is production-ready. Plan for adequate node resources and expect 30-60 minutes of elevated resource usage during rolling upgrades. The design balances isolation benefits with operational simplicity, making it suitable for deployments requiring channel-level performance guarantees.
 
-### System Tests
-- **Load Testing**:
-  - Multiple collections with exclusive mode enabled
-  - Node failure and recovery during query workload
-  - Upgrade scenarios with active queries
+---
 
-- **Resource Monitoring**:
-  - CPU/memory/I/O impact during mode transitions
-  - Performance degradation measurement
-  - Recovery time tracking
-
-### Verification Checklist
-
-| Feature | Test | Status |
-|---------|------|--------|
-| Activation conditions | Unit tests verify node count checking | ✓ |
-| Node assignment algorithm | Unit and integration tests | ✓ |
-| Dynamic enablement | ReplicaObserver tests | ✓ |
-| Balancing strategies | Channel and segment plan tests | ✓ |
-| Configuration parameters | Parameterized unit tests | ✓ |
-| Fallback behavior | ScoreBasedBalancer delegation tests | ✓ |
-| Node removal handling | Integration tests | ✓ |
-| Rolling upgrade | Upgrade scenario tests | ✓ |
-| Performance impact | Load tests and monitoring | ✓ |
-
-## References
+## 10. References
 
 ### Code Files
 
@@ -897,6 +870,6 @@ Channel Exclusive Mode is implemented with comprehensive testing across multiple
 
 ---
 
-**Document Version**: 2.0
+**Document Version**: 1.0
 **Date**: 2026-02-04
-**Status**: Ready for Review
+**Author**: Milvus QueryCoord Team

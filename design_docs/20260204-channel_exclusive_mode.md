@@ -1,0 +1,902 @@
+# MEP: Channel Exclusive Mode for QueryCoord
+
+- **Created:** 2026-02-04
+- **Author(s):** @wei-liu
+- **Status:** Draft
+- **Component:** QueryCoord
+- **Related Issues:** #47500, #47505
+- **Released:** 2.6.0
+
+## Summary
+
+Channel Exclusive Mode is a channel-centric load balancing strategy for Milvus QueryCoord that assigns each channel exclusively to a dedicated set of QueryNodes. This design document describes the architecture, data structures, and implementation details of channel exclusive mode enabled by default in Milvus 2.6.
+
+## Motivation
+
+### Problem Statement
+
+In Milvus QueryCoord, the traditional load balancing strategy distributes channels and segments across QueryNodes without strict isolation. This approach can lead to several issues:
+
+- **Resource Contention**: Multiple channels competing for resources on the same QueryNode can cause unpredictable performance degradation
+- **Load Imbalance**: Channels with different workload characteristics may not be balanced effectively
+- **Scalability Challenges**: As the number of channels grows, fine-grained control over channel-to-node mapping becomes difficult
+- **Isolation Requirements**: Some use cases require strict isolation between channels for performance guarantees or fault isolation
+
+### Goals
+
+**Channel Exclusive Mode** aims to address these challenges by introducing a channel-centric load balancing strategy with the following goals:
+
+1. **Predictable Performance**: Assign each channel exclusively to a dedicated set of QueryNodes
+2. **Better Isolation**: Prevent interference between channels by ensuring they run on separate node groups
+3. **Flexible Configuration**: Allow administrators to control the degree of exclusivity through configuration parameters
+4. **Backward Compatibility**: Gracefully fall back to traditional balancing when exclusivity constraints cannot be met
+5. **Dynamic Adaptation**: Automatically enable or disable exclusive mode based on cluster state and configuration
+
+## Design Details
+
+### 2.1 High-Level Design
+
+Channel Exclusive Mode is implemented as an extension to Milvus QueryCoord's balancing system. The design follows these key principles:
+
+- **Channel-First Approach**: Balance decisions are made at the channel level before considering segment-level balancing
+- **Exclusive Node Assignment**: Each channel is assigned to a subset of RW (Read-Write) nodes that handle all operations for that channel
+- **Fallback Mechanism**: When exclusivity requirements cannot be met (e.g., insufficient nodes), the system falls back to traditional segment-level balancing
+- **Copy-on-Write Pattern**: Replica state modifications use immutable data structures to ensure thread safety
+
+### 2.2 System Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   QueryCoord Services                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ReplicaManager                                        │  │
+│  │ - Creates replicas with exclusive mode enabled       │  │
+│  │ - Persists replica state to etcd                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+│           │                              ↑                   │
+│           │ create/update                │ read              │
+│           ↓                              │                   │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ Replica (Immutable + Mutable)                        │  │
+│  │ - Stores ChannelNodeInfos mapping                    │  │
+│  │ - Manages exclusive node assignments                 │  │
+│  │ - Provides COW semantics for updates                 │  │
+│  └──────────────────────────────────────────────────────┘  │
+│           ↑                              │                   │
+│           │ monitor/update               │ query             │
+│           │                              ↓                   │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ReplicaObserver                                       │  │
+│  │ - Monitors replica state periodically                │  │
+│  │ - Enables/disables exclusive mode dynamically        │  │
+│  │ - Cleans up RO nodes when not needed                 │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ChannelLevelScoreBalancer                             │  │
+│  │ - Implements channel-aware load balancing            │  │
+│  │ - Generates channel/segment movement plans           │  │
+│  │ - Falls back to ScoreBasedBalancer when needed       │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3. Core Data Structures
+
+#### 3.1 ChannelNodeInfo (Proto)
+
+**File**: `pkg/proto/query_coord.proto`
+
+```protobuf
+message ChannelNodeInfo {
+    repeated int64 rw_nodes = 6;  // RW nodes exclusively assigned to this channel
+}
+
+message Replica {
+    int64 ID = 1;
+    int64 collectionID = 2;
+    repeated int64 nodes = 3;              // All RW nodes in this replica
+    repeated int64 ro_nodes = 5;           // Read-only nodes
+    string resource_group = 4;
+    map<string, ChannelNodeInfo> channel_node_infos = 6;  // Channel → Node mapping
+    repeated int64 rw_sq_nodes = 7;        // Streaming query nodes (RW)
+    repeated int64 ro_sq_nodes = 8;        // Streaming query nodes (RO)
+}
+```
+
+**Design Rationale**:
+- **Map Structure**: Using a map allows O(1) lookup for a channel's assigned nodes
+- **Separate RW/RO Tracking**: Distinguishes between read-write and read-only nodes for different load patterns
+- **Streaming Support**: Includes separate fields for streaming query nodes to support future streaming workloads
+
+#### 3.2 Replica (Immutable)
+
+**File**: `internal/querycoordv2/meta/replica.go`
+
+```go
+type Replica struct {
+    replicaPB     *querypb.Replica       // Protobuf representation with ChannelNodeInfos
+    rwNodes       typeutil.UniqueSet     // RW nodes (non-streaming)
+    roNodes       typeutil.UniqueSet     // RO nodes (non-streaming)
+    rwSQNodes     typeutil.UniqueSet     // RW streaming query nodes
+    roSQNodes     typeutil.UniqueSet     // RO streaming query nodes
+    loadPriority  commonpb.LoadPriority
+}
+```
+
+**Key Methods**:
+- `GetChannelRWNodes(channelName string) []int64`: Returns the exclusive RW nodes for a channel
+- `IsChannelExclusiveModeEnabled() bool`: Checks if ChannelNodeInfos are initialized
+- `CopyForWrite() *mutableReplica`: Creates a mutable copy for modifications
+
+**Design Rationale**:
+- **Immutability**: Prevents concurrent modification bugs and enables lock-free reads
+- **UniqueSet**: Ensures no duplicate nodes in the replica
+- **COW Pattern**: Modifications create new instances rather than mutating in-place
+
+#### 3.3 mutableReplica (Copy-on-Write)
+
+```go
+type mutableReplica struct {
+    *Replica
+    exclusiveRWNodeToChannel map[int64]string  // Reverse mapping: Node → Channel
+}
+```
+
+**Key Methods**:
+- `TryEnableChannelExclusiveMode(channelNames ...string)`: Initializes channel exclusive mode
+- `tryBalanceNodeForChannel()`: Rebalances node assignments across channels
+- `DisableChannelExclusiveMode()`: Clears ChannelNodeInfos
+- `IntoReplica() *Replica`: Converts mutable copy back to immutable replica
+
+**Design Rationale**:
+- **Reverse Mapping**: `exclusiveRWNodeToChannel` enables O(1) checks for node availability
+- **Transient State**: Reverse mapping is only maintained during mutations, not persisted
+- **Explicit Conversion**: `IntoReplica()` enforces intentional conversion back to immutable state
+
+### 4. Channel Exclusive Mode Lifecycle
+
+#### 4.1 Activation Conditions
+
+Channel exclusive mode is activated when **all** of the following conditions are met:
+
+1. **Balancer Configuration**: `queryCoord.balancer` is set to `"ChannelLevelScoreBalancer"`
+2. **Sufficient Nodes**: `replica.RWNodesCount() >= len(channels) * channelExclusiveNodeFactor`
+   - `channelExclusiveNodeFactor` defaults to `1` (at least 1 node per channel)
+3. **Channels Registered**: All collection channels are known to the replica
+
+**Check Logic** (`replica.go:409-445`):
+
+```go
+func shouldEnableChannelExclusiveMode(channelInfos map[string]*querypb.ChannelNodeInfo) bool {
+    balancePolicy := paramtable.Get().QueryCoordCfg.Balancer.GetValue()
+    if balancePolicy != ChannelLevelScoreBalancerName {
+        return false
+    }
+
+    channelExclusiveFactor := paramtable.Get().QueryCoordCfg.ChannelExclusiveNodeFactor.GetAsInt()
+    return r.RWNodesCount() >= len(channelInfos) * channelExclusiveFactor
+}
+```
+
+#### 4.2 Initialization Flow
+
+**Scenario 1: New Collection Load**
+
+```
+User.LoadCollection(collection, replicaNum=2)
+    ↓
+QueryCoord.LoadCollection()
+    ↓
+ReplicaManager.Spawn(collection, replicaNum, channels)
+    ├─ Check: Is ChannelLevelScoreBalancer enabled?
+    ├─ If YES:
+    │  ├─ Create Replica with default nodes
+    │  ├─ mutableReplica.TryEnableChannelExclusiveMode(channels...)
+    │  │  ├─ Initialize ChannelNodeInfos for all channels (empty node lists)
+    │  │  └─ Call tryBalanceNodeForChannel() to assign nodes
+    │  └─ Persist replica with ChannelNodeInfos
+    └─ If NO: Create replica without ChannelNodeInfos
+```
+
+**Scenario 2: Dynamic Enablement**
+
+```
+ReplicaObserver.checkNodesInReplica() [Periodic Task]
+    ↓
+For each replica:
+    ├─ Check: Is ChannelLevelScoreBalancer enabled?
+    ├─ Check: Is exclusive mode already enabled?
+    ├─ If should enable but not yet enabled:
+    │  ├─ Load all collection channels from TargetManager
+    │  ├─ mutableReplica.TryEnableChannelExclusiveMode(channels...)
+    │  └─ Persist updated replica
+    └─ Continue monitoring
+```
+
+#### 4.3 Node Assignment Algorithm
+
+**Location**: `replica.go:409-575`
+
+##### 4.3.1 Calculate Optimal Assignments
+
+**Goal**: Distribute nodes evenly across channels
+
+```go
+func calculateOptimalAssignments(totalNodes, channelCount int) map[string]int {
+    baseNodes := totalNodes / channelCount           // Base allocation per channel
+    extraNodes := totalNodes % channelCount          // Remaining nodes to distribute
+
+    assignments := make(map[string]int)
+    for i, channelName := range sortedChannels {
+        assignments[channelName] = baseNodes
+        if i < extraNodes {
+            assignments[channelName]++  // Distribute extra nodes to first few channels
+        }
+    }
+    return assignments
+}
+```
+
+**Example**:
+- 7 nodes, 3 channels → `[3, 2, 2]` (first channel gets extra node)
+- 6 nodes, 3 channels → `[2, 2, 2]` (even distribution)
+
+##### 4.3.2 Rebalance Channel Nodes
+
+**Two-Phase Process**:
+
+**Phase 1: Release Excess Nodes**
+
+```go
+func releaseExcessNodes(targetAssignments map[string]int) {
+    for _, channelName := range sortedChannels {
+        currentNodes := r.GetChannelRWNodes(channelName)
+        targetCount := targetAssignments[channelName]
+
+        if len(currentNodes) > targetCount {
+            // Keep first targetCount nodes, release the rest
+            nodesToKeep := currentNodes[:targetCount]
+            nodesToRelease := currentNodes[targetCount:]
+
+            for _, nodeID := range nodesToRelease {
+                delete(r.exclusiveRWNodeToChannel, nodeID)
+            }
+
+            r.replicaPB.ChannelNodeInfos[channelName].RwNodes = nodesToKeep
+        }
+    }
+}
+```
+
+**Phase 2: Allocate Nodes to Under-Allocated Channels**
+
+```go
+func allocateInsufficientNodes(targetAssignments map[string]int) {
+    availableNodes := r.getAvailableNodes()  // Nodes not exclusively assigned
+
+    for _, channelName := range sortedChannels {
+        currentNodes := r.GetChannelRWNodes(channelName)
+        targetCount := targetAssignments[channelName]
+
+        if len(currentNodes) < targetCount {
+            neededCount := targetCount - len(currentNodes)
+            selectedNodes := allocateNodesFromPool(availableNodes, neededCount)
+
+            for _, nodeID := range selectedNodes {
+                r.replicaPB.ChannelNodeInfos[channelName].RwNodes =
+                    append(r.replicaPB.ChannelNodeInfos[channelName].RwNodes, nodeID)
+                r.exclusiveRWNodeToChannel[nodeID] = channelName
+            }
+
+            // Remove allocated nodes from available pool
+            availableNodes = removeNodes(availableNodes, selectedNodes)
+        }
+    }
+}
+```
+
+**Allocation Order**: Channels are sorted by current node count (ascending) to prioritize under-allocated channels
+
+### 5. ChannelLevelScoreBalancer
+
+#### 5.1 Design Philosophy
+
+The `ChannelLevelScoreBalancer` extends the traditional `ScoreBasedBalancer` with channel-awareness:
+
+- **Composition Over Inheritance**: Embeds `ScoreBasedBalancer` and delegates to it when exclusivity is not feasible
+- **Graceful Degradation**: Falls back to segment-level balancing when channel exclusive mode is disabled
+- **Channel Priority**: Balances channels first, then segments within each channel's node group
+
+**File**: `internal/querycoordv2/balance/channel_level_score_balancer.go`
+
+```go
+type ChannelLevelScoreBalancer struct {
+    *ScoreBasedBalancer  // Embedded for fallback behavior
+    targetMgr meta.TargetManagerInterface
+}
+```
+
+#### 5.2 BalanceReplica Logic
+
+**High-Level Flow** (`channel_level_score_balancer.go:69-160`):
+
+```
+BalanceReplica(ctx, replica)
+    ↓
+1. Check Streaming Service
+    ├─ If enabled: Call ScoreBasedBalancer.balanceChannels()
+    └─ Return early if plans generated
+    ↓
+2. Check Exclusive Mode Eligibility
+    ├─ For each channel:
+    │  └─ If GetChannelRWNodes(channel) is empty → exclusive mode disabled
+    └─ If disabled: Delegate to ScoreBasedBalancer.BalanceReplica() → Return
+    ↓
+3. Channel-Aware Balancing (Exclusive Mode Enabled)
+    For each channel:
+        ├─ Get channel's exclusive RW nodes
+        ├─ Identify outbound nodes (nodes no longer in RW node list)
+        ├─ If outbound nodes exist:
+        │  ├─ genChannelPlanForOutboundNodes()
+        │  └─ genSegmentPlanForOutboundNodes()
+        └─ If no outbound nodes:
+           ├─ If AutoBalanceChannel enabled:
+           │  └─ genChannelPlan() - balance channel distribution
+           └─ Else:
+              └─ genSegmentPlan() - balance segments within channel nodes
+    ↓
+4. Return Plans
+    └─ (segmentPlans, channelPlans)
+```
+
+#### 5.3 Balancing Strategies
+
+##### 5.3.1 Channel Balancing (`genChannelPlan`)
+
+**Goal**: Distribute channels evenly across online nodes
+
+**Location**: `channel_level_score_balancer.go:272-312`
+
+**Algorithm**:
+```
+1. Calculate target: avgChannelsPerNode = totalChannels / onlineNodeCount
+2. For each online node:
+   - If node.channelCount > avgChannelsPerNode + 1:
+     - Mark as sourceNode (overloaded)
+   - If node.channelCount < avgChannelsPerNode:
+     - Mark as targetNode (under-loaded)
+3. For each sourceNode:
+   - Select channels to move (excess channels)
+   - Assign to least-loaded targetNode
+   - Create ChannelPlan(channel, sourceNode → targetNode)
+```
+
+**Example**:
+- 6 channels, 3 nodes: Target = 2 channels/node
+- Current: `[4, 1, 1]` → Move 2 channels from node 0 → nodes 1 and 2
+- Result: `[2, 2, 2]`
+
+##### 5.3.2 Segment Balancing (`genSegmentPlan`)
+
+**Goal**: Balance segment load within a channel's exclusive node group
+
+**Location**: `channel_level_score_balancer.go:200-270`
+
+**Algorithm**:
+```
+1. Get channel's exclusive RW nodes
+2. Convert nodes to NodeItems with scores (resource-based)
+3. Identify source nodes (high score) and target nodes (low score)
+4. For each segment on source node:
+   - Skip redundant segments (already on target)
+   - Create SegmentPlan(segment, sourceNode → targetNode)
+   - Update node scores
+5. Return plans
+```
+
+**Node Score Calculation** (inherited from `ScoreBasedBalancer`):
+```
+score = α * CPU% + β * Memory% + γ * DelegatorScore
+```
+
+##### 5.3.3 Outbound Node Handling
+
+**Outbound Node**: A node that was previously assigned to a channel but is no longer in the channel's RW node list (due to node removal or rebalancing)
+
+**genChannelPlanForOutboundNodes()** (`channel_level_score_balancer.go:162-176`)
+
+```go
+func (b *ChannelLevelScoreBalancer) genChannelPlanForOutboundNodes(
+    ctx context.Context,
+    replica *meta.Replica,
+    channelName string,
+    channelRwNodes []int64,
+    channelPlans []ChannelAssignPlan,
+) []ChannelAssignPlan {
+    // Find nodes with this channel that are not in channelRwNodes
+    currentAssignment := b.dist.ChannelDistManager.GetByCollectionAndFilter(...)
+
+    for _, view := range currentAssignment {
+        if !lo.Contains(channelRwNodes, view.Node) {
+            // Node has channel but shouldn't → Move away
+            targetNode := selectLeastLoadedNode(channelRwNodes)
+            plan := ChannelAssignPlan{
+                Channel: view.Channel,
+                From:    view.Node,
+                To:      targetNode,
+                Replica: replica,
+            }
+            channelPlans = append(channelPlans, plan)
+        }
+    }
+    return channelPlans
+}
+```
+
+**genSegmentPlanForOutboundNodes()** (`channel_level_score_balancer.go:178-195`)
+
+Similar logic but for segments:
+```
+1. Find segments on outbound nodes
+2. Move to nodes in channelRwNodes
+3. Create SegmentPlan for each segment
+```
+
+### 6. Configuration Parameters
+
+#### 6.1 Key Parameters
+
+**File**: `pkg/util/paramtable/component_param.go`
+
+| Parameter | Config Key | Default | Version | Description |
+|-----------|------------|---------|---------|-------------|
+| `Balancer` | `queryCoord.balancer` | `"ChannelLevelScoreBalancer"` | 2.4+ | Balancer type selection |
+| `ChannelExclusiveNodeFactor` | `queryCoord.channelExclusiveNodeFactor` | `"1"` | 2.4.2+ | Minimum nodes per channel to enable exclusive mode |
+| `AutoBalanceChannel` | `queryCoord.autoBalanceChannel` | `false` | 2.3+ | Whether to auto-rebalance channels (inherited from parent) |
+
+#### 6.2 Configuration Examples
+
+##### Example 1: Default (1 node per channel)
+
+```yaml
+queryCoord:
+  balancer: ChannelLevelScoreBalancer
+  channelExclusiveNodeFactor: 1
+```
+
+**Behavior**:
+- Collection with 4 channels + 4 RW nodes → Exclusive mode enabled (1 node per channel)
+- Collection with 4 channels + 3 RW nodes → Exclusive mode disabled (insufficient nodes)
+
+##### Example 2: High Isolation (2 nodes per channel)
+
+```yaml
+queryCoord:
+  balancer: ChannelLevelScoreBalancer
+  channelExclusiveNodeFactor: 2
+```
+
+**Behavior**:
+- Collection with 4 channels + 8 RW nodes → Exclusive mode enabled (2 nodes per channel)
+- Collection with 4 channels + 7 RW nodes → Exclusive mode disabled (insufficient nodes)
+
+##### Example 3: Disable Exclusive Mode
+
+```yaml
+queryCoord:
+  balancer: ScoreBasedBalancer  # Use traditional balancer
+```
+
+**Behavior**:
+- All replicas use segment-level balancing regardless of node count
+
+### 7. Complete Data Flow Example
+
+#### 7.1 Collection Load with Exclusive Mode
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 1: User loads collection                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  User: LoadCollection(                                          │
+│      collection = "product_catalog",                            │
+│      replicaNum = 2,                                            │
+│      channels = ["channel_0", "channel_1", "channel_2"]         │
+│  )                                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 2: ReplicaManager.Spawn creates replicas                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Config: queryCoord.balancer = "ChannelLevelScoreBalancer"     │
+│  Config: queryCoord.channelExclusiveNodeFactor = 1             │
+│                                                                  │
+│  For replica 1:                                                 │
+│    ├─ Assign nodes: [1, 2, 3, 4, 5]                            │
+│    ├─ Check: 5 nodes >= 3 channels * 1 → Eligible              │
+│    ├─ TryEnableChannelExclusiveMode(channels...)               │
+│    │  ├─ Initialize ChannelNodeInfos:                           │
+│    │  │  "channel_0": {rw_nodes: []}                           │
+│    │  │  "channel_1": {rw_nodes: []}                           │
+│    │  │  "channel_2": {rw_nodes: []}                           │
+│    │  └─ Call tryBalanceNodeForChannel()                       │
+│    │     ├─ Calculate assignments: [2, 2, 1]                   │
+│    │     │  (5 nodes / 3 channels = 1 base + 2 extra)          │
+│    │     └─ Assign nodes:                                       │
+│    │        "channel_0": {rw_nodes: [1, 2]}                    │
+│    │        "channel_1": {rw_nodes: [3, 4]}                    │
+│    │        "channel_2": {rw_nodes: [5]}                       │
+│    └─ Persist replica to etcd                                   │
+│                                                                  │
+│  For replica 2: (same logic with different nodes)              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 3: QueryCoord balancer runs (periodic task)               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ChannelLevelScoreBalancer.BalanceReplica(replica1)             │
+│    ↓                                                             │
+│    Check: Is exclusive mode enabled?                            │
+│      → YES (ChannelNodeInfos exist)                             │
+│    ↓                                                             │
+│    For "channel_0":                                             │
+│      ├─ RW nodes: [1, 2]                                        │
+│      ├─ Check outbound nodes: None                              │
+│      └─ genSegmentPlan(segments, nodes=[1,2])                   │
+│         → Move segments to balance load on nodes 1 and 2        │
+│    ↓                                                             │
+│    For "channel_1":                                             │
+│      ├─ RW nodes: [3, 4]                                        │
+│      ├─ Check outbound nodes: None                              │
+│      └─ genSegmentPlan(segments, nodes=[3,4])                   │
+│    ↓                                                             │
+│    For "channel_2":                                             │
+│      ├─ RW nodes: [5]                                           │
+│      ├─ Check outbound nodes: None                              │
+│      └─ genSegmentPlan(segments, nodes=[5])                     │
+│         → No balancing needed (only 1 node)                     │
+│    ↓                                                             │
+│    Return plans: (segmentPlans, channelPlans)                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 4: Scheduler executes plans                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  For each SegmentPlan:                                          │
+│    └─ Move segment from source node → target node              │
+│                                                                  │
+│  For each ChannelPlan:                                          │
+│    └─ Reassign channel from source node → target node          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 5: ReplicaObserver monitors state (continuous)            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Every 1 second:                                                │
+│    ├─ Check if exclusive mode should be enabled                │
+│    │  → Already enabled, no action                              │
+│    ├─ Check RO nodes for cleanup                                │
+│    │  → None present                                            │
+│    └─ Continue monitoring                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2 Node Removal Scenario
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Initial State:                                                   │
+│   channel_0: [1, 2]                                             │
+│   channel_1: [3, 4]                                             │
+│   channel_2: [5]                                                │
+│                                                                  │
+│ Event: Node 2 goes offline                                      │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 1: ReplicaManager detects node failure                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  RemoveNode(replicaID=1, nodeID=2)                              │
+│    ├─ Remove node 2 from replica.rwNodes                        │
+│    ├─ Trigger tryBalanceNodeForChannel()                        │
+│    │  ├─ New assignments: [1, 2, 1] for 4 nodes                │
+│    │  └─ Rebalance:                                              │
+│    │     channel_0: [1, 2] → [1] (node 2 removed)              │
+│    │     channel_1: [3, 4] → [3, 4]                             │
+│    │     channel_2: [5] → [5, 2]  (node 2 reassigned here)     │
+│    │     Wait... node 2 is offline!                             │
+│    │     ↓ Retry with available nodes                           │
+│    │     channel_0: [1]                                         │
+│    │     channel_1: [3, 4]                                       │
+│    │     channel_2: [5]                                          │
+│    └─ Persist updated replica                                    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 2: ChannelLevelScoreBalancer.BalanceReplica               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  For "channel_0":                                               │
+│    ├─ Current RW nodes: [1]                                     │
+│    ├─ Check distribution: Node 2 has channel_0                  │
+│    │  → Node 2 not in RW nodes → Outbound node!                │
+│    └─ genChannelPlanForOutboundNodes()                          │
+│       → ChannelPlan: Move channel_0 from node 2 → node 1       │
+│                                                                  │
+│  For "channel_0" segments:                                      │
+│    ├─ Check distribution: Node 2 has segments                   │
+│    │  → Node 2 is outbound                                      │
+│    └─ genSegmentPlanForOutboundNodes()                          │
+│       → SegmentPlans: Move all segments from node 2 → node 1   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 3: Scheduler executes movement plans                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Execute ChannelPlan: channel_0 (node 2 → node 1)              │
+│  Execute SegmentPlans: segments (node 2 → node 1)              │
+│                                                                  │
+│  Final State:                                                    │
+│    channel_0: [1]        (all workload on node 1)              │
+│    channel_1: [3, 4]                                            │
+│    channel_2: [5]                                               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Compatibility, Deprecation, and Migration Plan
+
+> **⚠️ WARNING: Performance Impact**
+>
+> Switching channel exclusive mode (enabling or disabling) triggers **massive rebalancing** that will:
+> - Cause 50-80% CPU spike on QueryNodes (segment loading, index loading)
+> - Temporarily double memory usage (old and new segments co-exist)
+> - Generate heavy disk I/O and network traffic
+> - Degrade query performance (2-5x latency increase, 30-50% QPS reduction)
+>
+> **Recommendation**: Perform during low-traffic maintenance windows and monitor cluster resources closely.
+
+### 8.1 Enabling Channel Exclusive Mode
+
+**For Existing Clusters**:
+
+1. **Check Prerequisites**:
+   ```bash
+   # Ensure sufficient nodes
+   # Required: totalNodes >= channels * channelExclusiveNodeFactor
+   ```
+
+2. **Update Configuration** (Runtime Configuration Change):
+   ```yaml
+   queryCoord:
+     balancer: ChannelLevelScoreBalancer
+     channelExclusiveNodeFactor: 1  # Start with minimum requirement
+   ```
+
+3. **Wait for Automatic Enablement**:
+   - **No restart required**: The `Balancer` parameter is runtime-refreshable (`refreshable:"true"`)
+   - **ReplicaObserver** monitors configuration every 1 second and automatically enables exclusive mode
+   - Changes take effect within 1 second
+
+4. **Monitor Transition**:
+   ```bash
+   # Check replica state
+   # ReplicaObserver will enable exclusive mode within 1 second
+
+   # Check logs
+   kubectl logs -f milvus-querycoord | grep "channel exclusive mode"
+   ```
+
+**How It Works**:
+- `ReplicaObserver.checkNodesInReplica()` runs every 1 second
+- Dynamically reads `queryCoord.balancer` configuration
+- If balancer is `ChannelLevelScoreBalancer` and replica doesn't have exclusive mode:
+  - Calls `mutableReplica.TryEnableChannelExclusiveMode()`
+  - Persists updated replica state to etcd
+
+**Expected Behavior**:
+- No downtime: Existing queries continue to work
+- No restart needed: Configuration changes are applied automatically
+- Gradual transition: Channels are reassigned over time based on balancing cycles
+- Automatic rollback: If node count drops below threshold, mode is disabled automatically
+
+### 8.2 Disabling Channel Exclusive Mode
+
+**Rollback Steps**:
+
+1. **Update Configuration** (Runtime Configuration Change):
+   ```yaml
+   queryCoord:
+     balancer: ScoreBasedBalancer  # Switch to traditional balancer
+   ```
+
+2. **Wait for Automatic Disablement**:
+   - **No restart required**: Configuration change is applied automatically
+   - **ReplicaObserver** and **tryBalanceNodeForChannel()** monitor configuration continuously
+   - Changes take effect within 1 second
+
+3. **Verify Rollback**:
+   ```bash
+   # Check that ChannelNodeInfos are cleared
+   # Automatic disablement happens within 1 second
+   ```
+
+**How It Works**:
+- Two mechanisms trigger automatic disablement:
+  1. **ReplicaObserver** detects balancer configuration change
+  2. **tryBalanceNodeForChannel()** checks `shouldEnableChannelExclusiveMode()`:
+     - Returns `false` if balancer is not `ChannelLevelScoreBalancer`
+     - Returns `false` if node count insufficient
+     - Calls `DisableChannelExclusiveMode()` to clear ChannelNodeInfos
+
+**Data Consistency**:
+- No data loss: ChannelNodeInfos are simply cleared from replica metadata
+- No segment movement required: Existing segment distribution remains valid
+- No restart needed: ScoreBasedBalancer takes over balancing responsibility immediately
+
+### 8.3 Rolling Upgrade Scenario
+
+When upgrading from a version **without** channel exclusive mode to a version **with** it enabled by default, the upgrade process involves special considerations.
+
+**Upgrade Process**:
+
+1. **Rolling Upgrade Starts**:
+   - QueryNodes are upgraded one by one
+   - Old QueryNodes gradually become RO (Read-Only, stopping state)
+   - New QueryNodes start as RW (Read-Write, active state)
+
+2. **StoppingBalancer Takes Over**:
+   - **Purpose**: Rapidly evacuate data from RO nodes to maintain service availability
+   - **Behavior**: Moves channels and segments from RO nodes to **any available RW nodes**
+   - **Trade-off**: Temporarily breaks channel exclusive mode distribution for speed
+
+3. **Upgrade Completes**:
+   - All QueryNodes are now running the new version
+   - ChannelLevelScoreBalancer resumes normal operation
+   - Automatically restores channel exclusive mode distribution
+
+**What Happens to Channel Exclusive Mode**:
+
+```
+Initial State (before upgrade):
+  Collection A loaded, channel exclusive mode not enabled
+  Channels distributed across nodes without isolation
+
+During Upgrade (node-by-node):
+  Step 1: Node 1 becomes RO
+    └─ StoppingBalancer: Move channels from node 1 → any RW node (2,3,4,5)
+       ❌ May assign channel_0 to node 5 (not in exclusive list)
+
+  Step 2: Node 2 becomes RO
+    └─ StoppingBalancer: Move channels from node 2 → any RW node (3,4,5,6)
+       ❌ Distribution further deviates from exclusive mode
+
+  ... (continues for all nodes)
+
+After Upgrade (all nodes upgraded):
+  Step 1: ReplicaObserver detects replicas without ChannelNodeInfos
+    └─ Calls TryEnableChannelExclusiveMode() for all replicas
+       ✅ Initializes ChannelNodeInfos for each channel
+
+  Step 2: ChannelLevelScoreBalancer runs
+    └─ Detects channels on "outbound nodes" (nodes not in ChannelNodeInfos)
+    └─ Generates plans to move channels to correct exclusive nodes
+    └─ Gradually restores exclusive mode distribution
+```
+
+**Timeline and Resource Impact**:
+
+| Phase | Duration | Balancer | Resource Impact | Channel Distribution |
+|-------|----------|----------|-----------------|---------------------|
+| **Pre-Upgrade** | Stable | ScoreBasedBalancer | Normal | Non-exclusive, evenly distributed |
+| **During Upgrade** | 10-30 min | StoppingBalancer | **Very High** | Chaotic, breaks exclusive mode |
+| **Post-Upgrade (Recovery)** | 10-30 min | ChannelLevelScoreBalancer | **High** | Gradually restoring exclusive mode |
+| **Stable** | Ongoing | ChannelLevelScoreBalancer | Normal | Exclusive mode fully restored |
+
+**Important Notes**:
+
+> ⚠️ **Expected Behavior During Upgrade**:
+> - Channel exclusive mode distribution **will be temporarily violated**
+> - This is **by design** - StoppingBalancer prioritizes service availability over isolation
+> - Exclusive mode **will be automatically restored** after upgrade completes
+> - Do NOT manually intervene during the upgrade process
+
+> ⚠️ **Resource Planning**:
+> - Upgrade causes **two waves of rebalancing**:
+>   1. During upgrade (StoppingBalancer evacuation)
+>   2. After upgrade (ChannelLevelScoreBalancer restoration)
+> - Total impact time: **20 min to 60min** depending on cluster size
+> - Plan for **sustained high CPU/memory/I/O** during this period
+
+## Test Plan
+
+Channel Exclusive Mode is implemented with comprehensive testing across multiple levels:
+
+### Unit Tests
+- **Replica Logic** (`internal/querycoordv2/meta/replica_test.go`):
+  - Channel node assignment algorithm
+  - Exclusive mode enable/disable transitions
+  - Node rebalancing on node removal
+  - Configuration threshold checks
+
+- **ChannelLevelScoreBalancer** (`internal/querycoordv2/balance/channel_level_score_balancer_test.go`):
+  - Channel and segment plan generation
+  - Outbound node detection and handling
+  - Fallback to segment-level balancing
+  - Score calculation and node selection
+
+- **ReplicaObserver** (`internal/querycoordv2/observers/replica_observer_test.go`):
+  - Dynamic enable/disable on configuration change
+  - RO node cleanup
+  - Periodic monitoring and state updates
+
+### Integration Tests
+- **End-to-End Scenarios** (`tests/integration/balance/channel_exclusive_balance_test.go`):
+  - Collection load with sufficient/insufficient nodes
+  - Node removal and recovery
+  - Configuration changes and mode transitions
+  - Rolling upgrade scenarios
+
+### System Tests
+- **Load Testing**:
+  - Multiple collections with exclusive mode enabled
+  - Node failure and recovery during query workload
+  - Upgrade scenarios with active queries
+
+- **Resource Monitoring**:
+  - CPU/memory/I/O impact during mode transitions
+  - Performance degradation measurement
+  - Recovery time tracking
+
+### Verification Checklist
+
+| Feature | Test | Status |
+|---------|------|--------|
+| Activation conditions | Unit tests verify node count checking | ✓ |
+| Node assignment algorithm | Unit and integration tests | ✓ |
+| Dynamic enablement | ReplicaObserver tests | ✓ |
+| Balancing strategies | Channel and segment plan tests | ✓ |
+| Configuration parameters | Parameterized unit tests | ✓ |
+| Fallback behavior | ScoreBasedBalancer delegation tests | ✓ |
+| Node removal handling | Integration tests | ✓ |
+| Rolling upgrade | Upgrade scenario tests | ✓ |
+| Performance impact | Load tests and monitoring | ✓ |
+
+## References
+
+### Code Files
+
+- `internal/querycoordv2/meta/replica.go` - Core replica logic
+- `internal/querycoordv2/meta/replica_manager.go` - Replica lifecycle management
+- `internal/querycoordv2/balance/channel_level_score_balancer.go` - Main balancer implementation
+- `internal/querycoordv2/observers/replica_observer.go` - State monitoring and enforcement
+- `tests/integration/balance/channel_exclusive_balance_test.go` - Integration tests
+
+### Configuration
+
+- `pkg/util/paramtable/component_param.go` - Configuration parameters
+- `configs/milvus.yaml` - Default configuration file
+
+---
+
+**Document Version**: 2.0
+**Date**: 2026-02-04
+**Status**: Ready for Review

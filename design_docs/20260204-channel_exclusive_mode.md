@@ -1038,6 +1038,6 @@ Channel Exclusive Mode is production-ready. Plan for adequate node resources and
 
 **Document Version**: 1.1 (with Test Plan and Verification)
 **Date**: 2026-02-04
-**Author**: Milvus QueryCoord Team
+**Author**: weiliu1031
 **Status**: Ready for Review
 **Last Updated**: 2026-02-04 (Added comprehensive test plan and production verification checklist)

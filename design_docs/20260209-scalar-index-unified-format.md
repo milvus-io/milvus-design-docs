@@ -24,17 +24,25 @@
 │ Magic Number (8 bytes): "MVSIDXV3"       │
 ├──────────── Data Region ────────────────┤
 │ Entry 0 data                             │
-│ Entry 1 data                             │
 │ ...                                      │
 │ Entry N data                             │
+│ Meta Entry data (always last entry)      │
 ├──────────── Directory Table (JSON) ─────┤
-│ { "version": 3, "entries": [...] }       │
-├──────────── Footer (8 bytes) ───────────┤
-│ directory_table_size (uint64)            │
+│ { "entries": [...] }                     │
+├──────────── Footer (32 bytes) ──────────┤
+│ version       (uint16)  — format version │
+│ reserved      (22 bytes) — zero-filled   │
+│ meta_entry_size   (uint32)               │
+│ directory_table_size (uint32)            │
 └─────────────────────────────────────────┘
 ```
 
-Directory Table is at file tail. Data is written first, offsets recorded, then Directory Table and Footer appended.
+Tail three sections can be located from the end of file:
+- Footer: last 32 bytes.
+- Directory Table: `directory_table_size` bytes before Footer.
+- Meta Entry: `meta_entry_size` bytes before Directory Table.
+
+Data is written first, Meta Entry written last, then Directory Table and Footer appended.
 
 ### 2.2 Slice — Encryption Only
 
@@ -49,10 +57,10 @@ Slice is the **encryption boundary**, not a general format concept:
 
 ```json
 {
-  "version": 3,
   "entries": [
-    {"name": "SORT_INDEX_META", "offset": 0, "size": 48},
-    {"name": "index_data", "offset": 48, "size": 100000000}
+    {"name": "SORT_INDEX_META", "offset": 0, "size": 48, "crc32": "A1B2C3D4"},
+    {"name": "index_data", "offset": 48, "size": 100000000, "crc32": "E5F6A7B8"},
+    {"name": "__meta__", "offset": 100000048, "size": 64, "crc32": "C3D4E5F6"}
   ]
 }
 ```
@@ -61,12 +69,12 @@ Slice is the **encryption boundary**, not a general format concept:
 
 ```json
 {
-  "version": 3,
   "slice_size": 16777216,
   "entries": [
     {
       "name": "SORT_INDEX_META",
       "original_size": 48,
+      "crc32": "A1B2C3D4",
       "slices": [
         {"offset": 0, "size": 76}
       ]
@@ -74,9 +82,18 @@ Slice is the **encryption boundary**, not a general format concept:
     {
       "name": "index_data",
       "original_size": 100000000,
+      "crc32": "E5F6A7B8",
       "slices": [
         {"offset": 76, "size": 16777244},
         {"offset": 16777320, "size": 16777244}
+      ]
+    },
+    {
+      "name": "__meta__",
+      "original_size": 64,
+      "crc32": "C3D4E5F6",
+      "slices": [
+        {"offset": 33554564, "size": 92}
       ]
     }
   ],
@@ -86,15 +103,59 @@ Slice is the **encryption boundary**, not a general format concept:
 ```
 
 Field semantics:
+- `version` is in the Footer (uint16), not in the Directory Table.
 - Unencrypted: `offset` + `size` are position within Data Region (relative to Magic end).
 - Encrypted: all entries use `original_size` + `slices[]` format uniformly.
   - `original_size`: plaintext size, for pre-allocating buffer.
   - `slices[]`: each slice's position and ciphertext size (including IV/Tag overhead) in Data Region.
   - Even single-slice entries use `slices[]`.
+- `crc32`: CRC-32C (Castagnoli) checksum of the entry's **plaintext** data, stored as 8-char uppercase hex string. Present on every entry in both encrypted and unencrypted modes. Computed over the original data before encryption; verified after decryption (encrypted) or after read (unencrypted).
 - `__edek__` / `__ez_id__`: encryption metadata, present only when encrypted. `__ez_id__` stored as string.
 - `slice_size`: plaintext slice size, present only when encrypted.
 
 **Detection**: `__edek__` present → encrypted; absent → unencrypted.
+
+### 2.4 Meta Entry
+
+The Meta Entry is the **last entry** in the Data Region, always named `__meta__`. Physically it is a regular entry — same write, read, encryption treatment as all other entries. It is listed in the Directory Table like any other entry.
+
+Its position can also be located directly from the Footer (`meta_entry_size` bytes before Directory Table), enabling a single tail read to fetch Footer + Directory Table + Meta Entry without scanning the full directory.
+
+Content is a JSON object. Initial fields:
+
+```json
+{
+  "index_type": "stlsort",
+  "build_id": 12345
+}
+```
+
+The schema is extensible — new fields can be added without format version change.
+
+### 2.5 Footer
+
+Fixed 32 bytes, always the last 32 bytes of the file:
+
+```
+┌──────────────────────────────────────────┐
+│ Offset  Size   Field                      │
+├──────────────────────────────────────────┤
+│  0      2B     version (uint16, LE)       │
+│  2      22B    reserved (zero-filled)     │
+│  24     4B     meta_entry_size (uint32, LE)│
+│  28     4B     directory_table_size (uint32, LE)│
+└──────────────────────────────────────────┘
+```
+
+- `version`: format version, currently `3`.
+- `reserved`: zero-filled, available for future use.
+- `meta_entry_size`: on-disk byte size of the Meta Entry (ciphertext size if encrypted, plaintext size if not).
+- `directory_table_size`: byte size of the Directory Table JSON.
+
+**Read sequence from tail**:
+1. Read last 32 bytes → parse Footer → get `version`, `meta_entry_size`, `directory_table_size`.
+2. Compute `tail_size = 32 + directory_table_size + meta_entry_size`.
+3. If `tail_size ≤ initial_tail_read_size`, a single initial tail read already covers all three sections. `initial_tail_read_size` is a Milvus runtime config (default 64KB), not part of the file format.
 
 ---
 
@@ -116,6 +177,8 @@ public:
     virtual ~IndexEntryWriter() = default;
     virtual void WriteEntry(const std::string& name, const void* data, size_t size) = 0;
     virtual void WriteEntry(const std::string& name, int fd, size_t size) = 0;
+    // Set file-level metadata (written as the __meta__ entry during Finish).
+    virtual void SetMeta(const std::string& json) = 0;
     virtual void Finish() = 0;
     virtual size_t GetTotalBytesWritten() const = 0;
 };
@@ -157,7 +220,7 @@ class IndexEntryDirectStreamWriter : public IndexEntryWriter {
 };
 ```
 
-Constructor writes Magic. `Finish()` writes Directory Table JSON + Footer (uint64 dir_size), computes `total_bytes_written_`, closes stream.
+Constructor writes Magic. `WriteEntry()` computes CRC-32C incrementally (`crc32c_update` per chunk as data streams through) and records the final checksum in the directory entry. For fd-based entries, CRC is updated per 16MB read chunk — no extra memory. `Finish()` writes the Meta Entry (as the last regular entry), then Directory Table JSON, then 32-byte Footer (`version` + `meta_entry_size` + `directory_table_size`), computes `total_bytes_written_`, closes stream.
 
 ### 3.4 IndexEntryEncryptedLocalWriter (Encrypted)
 
@@ -167,7 +230,7 @@ Index → WriteEntry → encrypt thread pool (parallel) → ordered queue → se
                                                  upload local file → S3
 ```
 
-Encryption pipeline uses sliding window: W slices encrypt in parallel, dequeued in submission order, written sequentially to local file. Offset from actual `encrypted.size()` increment, always correct.
+Encryption pipeline uses sliding window: W slices encrypt in parallel, dequeued in submission order, written sequentially to local file. Offset from actual `encrypted.size()` increment, always correct. CRC-32C is computed incrementally by the main thread: each slice's plaintext is fed to `crc32c_update` before submitting to the encryption thread pool. Sequential read order guarantees correctness, no extra memory.
 
 **Thread pool**: Reuses V2 global priority thread pool `ThreadPools::GetThreadPool(MIDDLE)`.
 
@@ -181,6 +244,7 @@ public:
                          milvus_storage::ArrowFileSystemPtr fs,
                          std::shared_ptr<plugin::ICipherPlugin> cipher_plugin,
                          int64_t ez_id, int64_t collection_id,
+                         const std::string& temp_dir = "",
                          size_t slice_size = 16 * 1024 * 1024);
     ~IndexEntryEncryptedLocalWriter();
 
@@ -196,7 +260,7 @@ private:
 };
 ```
 
-Constructor obtains edek, creates temp file at `/tmp/milvus_enc_<uuid>`, writes Magic. Destructor cleans up fd and temp file. `Finish()` writes Directory Table (with `__edek__`, `__ez_id__`, `slice_size`) + Footer, closes fd, uploads local file via `UploadLocalFile()`, unlinks temp file.
+Constructor obtains edek, creates temp file at `<temp_dir>/milvus_enc_<uuid>`, writes Magic. `temp_dir` defaults to the Milvus config value `localStorage.path` (typically `/var/lib/milvus/data`); if that is empty, falls back to `/tmp`. Destructor cleans up fd and temp file. `Finish()` writes Meta Entry (encrypted, as last entry), then Directory Table (with `__edek__`, `__ez_id__`, `slice_size`), then 32-byte Footer, closes fd, uploads local file via `UploadLocalFile()`, unlinks temp file.
 
 ### 3.5 Factory Method
 
@@ -213,7 +277,8 @@ FileManagerImpl::CreateIndexEntryWriterV3(const std::string& filename,
             remote_path += "/" + GetFileName(filename);
             return std::make_unique<IndexEntryEncryptedLocalWriter>(
                 remote_path, fs_, cipher_plugin,
-                plugin_context_->ez_id, plugin_context_->collection_id);
+                plugin_context_->ez_id, plugin_context_->collection_id,
+                GetLocalTempDir());
         }
     }
     return std::make_unique<IndexEntryDirectStreamWriter>(
@@ -260,13 +325,14 @@ private:
 
 ### 4.2 Load Flow
 
-1. **Open()**: Validates Magic (1 ReadAt). Reads file tail (up to 64KB in one ReadAt) to get Footer + Directory Table. If Directory Table exceeds 64KB, does one additional ReadAt. Parses JSON, builds `name → EntryMeta` index. If `__edek__` present, obtains cipher plugin.
-2. **ReadEntry(name)** (small entry): Checks `small_entry_cache_` first. One `ReadAt`; if encrypted, creates `IDecryptor` to decrypt. Result cached if ≤ 1MB.
-3. **ReadEntry(name)** (large entry):
-   - Encrypted: Thread pool concurrent `ReadAt` for each slice (boundaries from Directory Table), each task creates own `IDecryptor`, decrypts, copies to target buffer.
-   - Unencrypted: Self-splits by 16MB ranges, concurrent `ReadAt`, copies to target buffer.
-4. **ReadEntryToFile(name, path)**: Same as above but output via `pwrite` to local file. `pwrite` is lock-free (each range writes different offset). Encrypted path does `ftruncate` first.
-5. **ReadEntriesToFiles(pairs)**: Sequential iteration, calls `ReadEntryToFile` for each pair.
+1. **Open()**: Validates Magic (1 ReadAt). Reads file tail (up to `initial_tail_read_size` in one ReadAt, default 64KB, configurable) to get Footer + Directory Table + Meta Entry. Parses 32-byte Footer to get `version`, `meta_entry_size`, `directory_table_size`. If `meta_entry_size + directory_table_size + 32` exceeds the initial read, does one additional ReadAt. Parses Directory Table JSON, builds `name → EntryMeta` index. If `__edek__` present, obtains cipher plugin. Meta Entry (`__meta__`) is accessible via normal `ReadEntry("__meta__")`.
+2. **ReadEntry(name)** (small entry): Checks `small_entry_cache_` first. One `ReadAt`; if encrypted, creates `IDecryptor` to decrypt. Verifies CRC-32C against the `crc32` field in Directory Table; throws on mismatch. Result cached if ≤ 1MB.
+3. **ReadEntry(name)** (large entry, to memory):
+   - Encrypted: Thread pool concurrent `ReadAt` for each slice, each task creates own `IDecryptor`, decrypts, copies to target buffer. After all slices assembled, verifies CRC-32C over the full plaintext buffer; throws on mismatch.
+   - Unencrypted: Self-splits by 16MB ranges, concurrent `ReadAt`, copies to target buffer. After all ranges assembled, verifies CRC-32C over the full buffer; throws on mismatch.
+   - CRC verification is a single sequential pass over the already-assembled buffer. No extra memory.
+4. **ReadEntryToFile(name, path)**: Same concurrent read but output via `pwrite` to local file. `pwrite` is lock-free (each range writes different offset). Encrypted path does `ftruncate` first. CRC verified via per-range `crc32c_combine` (see §6.1); no need to re-read the file.
+5. **ReadEntriesToFiles(pairs)**: Submits all entries to the thread pool concurrently — each entry's ranges/slices are read in parallel, and multiple entries are also processed in parallel. Cross-entry concurrency shares the same thread pool; total in-flight tasks bounded by pool size.
 
 **Thread safety**: Each decryption task creates own `IDecryptor` in lambda, destroyed after use.
 
@@ -274,7 +340,7 @@ private:
 
 | Step | IO Count |
 |------|----------|
-| Read Directory Table | 1–2 (tail read) |
+| Read Footer + Directory Table + Meta Entry | 1–2 (tail read) |
 | Read meta entry | 1 (all O(1) meta packed) |
 | Read large data entry | Concurrent, by slice/range count |
 
@@ -316,8 +382,9 @@ protected:
 1. Build filename: `milvus_packed_<type>_index.v3` (type from `GetIndexType()`, lowercased).
 2. Create writer via `file_manager_->CreateIndexEntryWriterV3(filename, is_index_file_)`.
 3. Call `WriteEntries(writer.get())`.
-4. Call `writer->Finish()`.
-5. Return `IndexStats` with the single packed file path and `writer->GetTotalBytesWritten()`.
+4. Call `writer->SetMeta(json)` with file-level metadata (index type, build id, etc.).
+5. Call `writer->Finish()` — writes `__meta__` entry, Directory Table, Footer.
+6. Return `IndexStats` with the single packed file path and `writer->GetTotalBytesWritten()`.
 
 **LoadV3 flow**:
 1. Read `INDEX_FILES` from config — must contain exactly 1 packed file path.
@@ -345,7 +412,7 @@ Meta structure definitions:
 
 ```cpp
 // ScalarIndexSort:  {"index_length": N, "num_rows": N, "is_nested": bool}
-// BitmapIndex:      YAML format: {bitmap_index_length: N, bitmap_index_num_rows: N}
+// BitmapIndex:      {"bitmap_index_length": N, "bitmap_index_num_rows": N}
 // StringIndexSort:  {"version": V, "num_rows": N, "is_nested": bool}
 // Tantivy:          {"file_names": [...], "has_null": bool}
 // Tantivy (Json):   {"file_names": [...], "has_null": bool, "has_non_exist": bool}
@@ -379,18 +446,21 @@ All thread pools reuse V2 `ThreadPools::GetThreadPool(priority)`, no custom pool
 ### Upload — Unencrypted
 
 ```
-Main thread: [Write to RemoteOutputStream] ──→ sequential fill
+Main thread: [read chunk → crc32c_update → Write to RemoteOutputStream] ──→ sequential fill
 RemoteOutputStream:  background_writes parallel upload Part 0, 1, 2...  ──→ S3
 ```
 
 ### Upload — Encrypted
 
 ```
+Main thread:  read slice_i → crc32c_update(crc, slice_i) → submit encrypt(slice_i)
 MIDD_SEGC_POOL (W threads):  parallel Encrypt slice 0, 1, 2...
 Main thread:  in-order .get() → sequential write to local file (>1GB/s)
     ↓ Finish()
 Upload local file via RemoteOutputStream → S3
 ```
+
+CRC-32C is computed in the main thread's sequential read loop, before encryption submission. No impact on encryption parallelism.
 
 ### Download/Load (Unified)
 
@@ -400,6 +470,30 @@ HIGH_SEGC_POOL (N threads, or caller-specified priority):
   * Decrypt only when encrypted
   "range" = encrypted: slice boundaries; unencrypted: 16MB self-split
 ```
+
+### 6.1 CRC-32C Verification in Parallel Download
+
+`crc32c_update(crc, data, len)` is chain-dependent — each call requires the previous CRC value, so it cannot run out of order. For **ReadEntry to memory**, the full plaintext buffer is already assembled after parallel download; CRC is verified via a single sequential pass.
+
+For **ReadEntryToFile**, data is written to file via `pwrite` without passing through a single buffer. CRC is verified using `crc32c_combine`:
+
+```
+Thread 0: ReadAt(range_0) → [Decrypt] → pwrite → crc_0 = crc32c(0, range_0_data, len_0)
+Thread 1: ReadAt(range_1) → [Decrypt] → pwrite → crc_1 = crc32c(0, range_1_data, len_1)
+Thread 2: ReadAt(range_2) → [Decrypt] → pwrite → crc_2 = crc32c(0, range_2_data, len_2)
+  (all threads run in parallel, compute per-range CRC independently)
+
+Main thread (after all tasks complete, combine in sequential order):
+  crc = crc32c_combine(crc_0, crc_1, len_1)
+  crc = crc32c_combine(crc,   crc_2, len_2)
+  verify crc == expected
+```
+
+**Key properties**:
+- Each thread computes its range CRC independently over data already in memory (the read buffer before `pwrite`). No extra memory.
+- `crc32c_combine(crc_a, crc_b, len_b)` merges two CRCs algebraically (GF(2) matrix exponentiation, `O(log(len_b))`), without accessing original data.
+- Per-range CRC **computation is parallel and order-independent**; only the final **combine must be in data order**.
+- Hardware-accelerated CRC-32C (SSE4.2 / ARMv8) runs at ~30 GB/s, negligible vs encryption (~5-10 GB/s) and network IO.
 
 ---
 
@@ -415,6 +509,8 @@ HIGH_SEGC_POOL (N threads, or caller-specified priority):
 | Download, to file | N × `range_size` (reusable) |
 
 Consistent with V2: peak determined by concurrency × slice size, does not grow with entry size.
+
+CRC-32C adds no extra memory: upload path uses incremental `crc32c_update` on data already being read; download-to-memory verifies over the output buffer; download-to-file computes per-range CRC on the existing read buffer and combines via `crc32c_combine`.
 
 ---
 
@@ -453,13 +549,7 @@ V3 keeps V2 remote root directory classification unchanged:
 
 ## 9. Open Questions
 
-### 9.1 Data Integrity Checksums
-
-V3 currently relies only on Magic Number + JSON Directory Table structural validation. No entry/slice-level integrity checks (CRC32/SHA256/HMAC).
-
-Directory Table JSON is extensible — checksum fields can be added later without format changes. Decision: deferred until driven by actual need.
-
-### 9.2 Why not encode the index into existing file format, like Lance?
+### 9.1 Why not encode the index into existing file format, like Lance?
 
 Lance is a columnar storage format that stores data in a columnar format. Any single Lance file has its own schema, and multiple Lance files form a table format.
 

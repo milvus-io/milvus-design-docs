@@ -17,6 +17,7 @@ Vector search results are typically sorted by similarity score (distance). Howev
 - **Common Search**: Single vector search with `order_by_fields`
 - **Hybrid Search**: Multi-vector search with `order_by_fields` in main search params
 - **Search with Group By**: Order by applies to groups (sorts groups by first row's value)
+- **Query**: `SELECT A, B, C FROM table WHERE ... ORDER BY B, C LIMIT 10`
 
 ### Unsupported Combinations
 - **Search Iterator**: `order_by` is not supported when using search iterators
@@ -339,6 +340,11 @@ Coverage includes:
 | `internal/proxy/task_search.go` | orderByFields field, pipeline integration |
 | `internal/proxy/task.go` | OrderByFieldsKey constant |
 | `internal/proxy/search_pipeline_test.go` | Unit tests for dictionary-based order_by_fields |
+
+## Query ORDER BY (Moved)
+
+The Query ORDER BY design has been separated into:
+- `design_docs/20260203-query-orderby.md`
 
 ## Future Improvements
 

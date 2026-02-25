@@ -17,7 +17,9 @@ Vector search results are typically sorted by similarity score (distance). Howev
 - **Common Search**: Single vector search with `order_by_fields`
 - **Hybrid Search**: Multi-vector search with `order_by_fields` in main search params
 - **Search with Group By**: Order by applies to groups (sorts groups by first row's value)
-- **Query**: `SELECT A, B, C FROM table WHERE ... ORDER BY B, C LIMIT 10`
+
+**Cross-link**: Query ORDER BY is documented separately in:
+- `design_docs/20260203-query-orderby.md`
 
 ### Unsupported Combinations
 - **Search Iterator**: `order_by` is not supported when using search iterators

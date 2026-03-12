@@ -32,6 +32,131 @@ Milvus Snapshot mechanism provides complete collection-level data snapshot capab
 - Protects indexes referenced by snapshots to ensure restore availability
 - Automatically cleans up associated storage files when snapshot is deleted
 
+## Snapshot Lifecycle Management
+
+### Design Motivation
+
+The original snapshot design used globally unique snapshot names. This was changed
+to per-collection unique names for three reasons:
+
+1. **User experience**: Different collections can have identically named snapshots
+   (e.g., both CollectionA and CollectionB can have "daily_backup"), which is the
+   natural mental model for users managing multiple collections
+2. **Lifecycle binding**: Snapshots are tightly coupled to their parent collection —
+   dropping a collection should automatically clean up all its snapshots
+3. **Permission alignment**: Snapshot privileges are scoped to collection level
+   (not global), and per-collection naming aligns with per-collection RBAC
+
+### Snapshot Name Scoping
+
+Snapshot names are unique **per-collection**, not globally. All snapshot lookup
+operations require both `collectionID` and `name` to identify a snapshot.
+
+**Internal Data Structure**:
+```go
+type snapshotMeta struct {
+    // Primary storage
+    snapshotID2Info *ConcurrentMap[UniqueID, *datapb.SnapshotInfo]
+
+    // Per-collection name index: collectionID -> (snapshotName -> snapshotID)
+    snapshotName2ID *ConcurrentMap[UniqueID, *ConcurrentMap[string, UniqueID]]
+
+    // Collection index: collectionID -> set of snapshot IDs
+    // Protected by collectionIndexMu (RWMutex) since UniqueSet is not thread-safe
+    collectionID2Snapshots *ConcurrentMap[UniqueID, UniqueSet]
+}
+```
+
+### Cascade Delete on Drop Collection
+
+When a collection is dropped, all its snapshots are automatically cleaned up
+through a two-layer fault tolerance mechanism:
+
+**Layer 1: Synchronous Cascade Delete (Primary Path)**
+
+During `dropCollectionV1AckCallback`, RootCoord broadcasts a
+`DropSnapshotsByCollection` WAL message as Step 2.5:
+
+```
+dropCollectionV1AckCallback:
+  Step 1: ReleaseCollection (QueryCoord)
+  Step 2: DropIndex (WAL broadcast)
+  Step 2.5: DropSnapshotsByCollection (WAL broadcast, best-effort)
+  Step 3: DropCollection meta (etcd)
+  Step 4: AddTombstone
+  Step 5: RefreshPolicyInfoCache (RBAC, immediate)
+  Step 6: ExpireCaches (Proxy meta cache)
+```
+
+Step 2.5 is **best-effort**: failure is logged at WARN level and does not block
+the drop collection flow.
+
+DataCoord receives the callback and executes `DropSnapshotsByCollection`:
+1. Get all snapshot IDs from `collectionID2Snapshots` index (copy under RLock)
+2. For each snapshot, call standard `DropSnapshot` (two-phase delete):
+   mark DELETING → remove from memory → delete S3 → drop catalog
+3. Collect errors but continue deleting remaining snapshots (try-best)
+4. Return aggregated errors
+
+**Layer 2: Asynchronous GC Fallback**
+
+The GC cycle (`recyclePendingSnapshots`) includes orphan detection for snapshots
+whose parent collection no longer exists:
+1. Scan `snapshotID2Info`, collect unique collectionIDs (skip DELETING state)
+2. For each collectionID, call `broker.HasCollection()` with 3s timeout
+3. If collection doesn't exist → call `DropSnapshotsByCollection()`
+
+This catches any snapshots missed by the cascade callback (e.g., callback failed,
+DataCoord was restarting during drop collection).
+
+The existing PENDING and DELETING cleanup in GC continues to handle incomplete
+two-phase deletes as before.
+
+**New WAL Message Type**:
+```protobuf
+// MessageType enum
+DropSnapshotsByCollection = 44;
+
+message DropSnapshotsByCollectionMessageHeader {
+    int64 collection_id = 1;
+}
+message DropSnapshotsByCollectionMessageBody {}
+```
+
+### RBAC: Snapshot Privileges at Collection Level
+
+Snapshot privileges are scoped to **Collection level** (not Global), with
+three permission tiers:
+
+| Tier | Privileges | Description |
+|------|-----------|-------------|
+| CollectionReadOnly | DescribeSnapshot, ListSnapshots | Safe read-only operations |
+| CollectionReadWrite | CreateSnapshot, DropSnapshot | Data modification operations |
+| CollectionAdmin | RestoreSnapshot | High-privilege: creates new collection |
+
+GetRestoreSnapshotState has no privilege check — the user already authenticated
+when calling RestoreSnapshot, and polling job status should not require
+re-authentication.
+
+### Known Limitations
+
+1. **Source collection deletion blocks restore**: Snapshots are lifecycle-bound
+   to their parent collection. When a collection is dropped, all its snapshots
+   are cascade-deleted (memory index + catalog + S3 via GC). RestoreSnapshot
+   will return "snapshot not found". Users must restore snapshots **before**
+   dropping the source collection.
+
+   *Design rationale*: Adding reference counting to prevent collection deletion
+   while snapshots exist would introduce distributed consistency complexity
+   (cross-component coordination between RootCoord and DataCoord). The current
+   design prioritizes simplicity — snapshot is a convenience feature, not a
+   durable backup system.
+
+2. **Collection ID reuse edge case**: If a deleted collection's ID were reused,
+   orphan GC might associate old snapshots with the new collection. In practice
+   this cannot happen because Milvus allocates monotonically increasing IDs via
+   TSO, so IDs are never reused.
+
 ## Snapshot Creation Process
 
 ### Creation Workflow
@@ -208,16 +333,32 @@ type StorageV2SegmentManifest struct {
 type SnapshotManager interface {
     // Snapshot lifecycle management
     CreateSnapshot(ctx context.Context, collectionID int64, name, description string) (int64, error)
-    DropSnapshot(ctx context.Context, name string) error
-    DescribeSnapshot(ctx context.Context, name string) (*SnapshotData, error)
-    ListSnapshots(ctx context.Context, collectionID, partitionID int64) ([]string, error)
+    DropSnapshot(ctx context.Context, collectionID int64, name string) error
+    DropSnapshotsByCollection(ctx context.Context, collectionID int64) error
+    GetSnapshot(ctx context.Context, collectionID int64, name string) (*datapb.SnapshotInfo, error)
+    DescribeSnapshot(ctx context.Context, collectionID int64, name string) (*SnapshotData, error)
+    ListSnapshots(ctx context.Context, collectionID, partitionID, dbID int64) ([]string, error)
 
     // Restore operations
-    RestoreSnapshot(ctx context.Context, snapshotName string, targetCollectionID int64) (int64, error)
+    RestoreSnapshot(ctx context.Context, sourceCollectionID int64, snapshotName string,
+        targetCollectionName, targetDbName string, ...) (int64, error)
+    RestoreData(ctx context.Context, sourceCollectionID int64, snapshotName string,
+        collectionID, jobID int64) (int64, error)
+    ReadSnapshotData(ctx context.Context, collectionID int64, snapshotName string) (*SnapshotData, error)
+
+    // Restore state query
     GetRestoreState(ctx context.Context, jobID int64) (*datapb.RestoreSnapshotInfo, error)
-    ListRestoreJobs(ctx context.Context, collectionID int64) ([]*datapb.RestoreSnapshotInfo, error)
+    ListRestoreJobs(ctx context.Context, collectionIDFilter, dbID int64) ([]*datapb.RestoreSnapshotInfo, error)
 }
 ```
+
+**ListSnapshots filtering**:
+
+| Filter | Behavior |
+|--------|----------|
+| `collectionID > 0` | Per-collection query via index — O(M) |
+| `dbID > 0, collectionID = 0` | Aggregate across all collections in database — O(N+M) |
+| Both = 0 | Full scan — O(N) |
 
 
 ### Snapshot Metadata Management
@@ -291,6 +432,12 @@ Phase 2 (Commit):
 - Removes a pending snapshot record from catalog
 - Called by GC after S3 files have been cleaned up
 
+**6. DropSnapshotsByCollection()**
+- Retrieves all snapshot IDs via `collectionID2Snapshots` index (copy under RLock)
+- Iterates and calls `DropSnapshot()` for each (standard two-phase delete)
+- Best-effort: collects errors via `errors.Join()`, continues on failure
+- Used by cascade callback and GC orphan cleanup
+
 ### Garbage Collection Integration
 
 **Pending Snapshot GC (recyclePendingSnapshots)**:
@@ -320,6 +467,22 @@ dataCoord:
   gc:
     snapshotPendingTimeout: 10m  # Time before pending snapshot is considered orphaned
 ```
+
+**Orphan Snapshot GC (recyclePendingSnapshots — extended)**:
+
+In addition to PENDING and DELETING cleanup, the GC cycle detects orphan
+snapshots whose parent collection has been dropped:
+
+```
+Process flow:
+1. Collect unique collectionIDs from non-DELETING snapshots in snapshotID2Info
+2. For each collectionID:
+   a. Call broker.HasCollection() with 3s timeout
+   b. If collection doesn't exist → call DropSnapshotsByCollection()
+3. Log cleanup results
+```
+
+This acts as a safety net for cascade callback failures.
 
 **Segment GC Protection**:
 
@@ -365,17 +528,23 @@ Create:
     -> SnapshotWriter.Save() (write to S3)
     -> SnapshotMeta.SaveSnapshot() (write to Etcd + memory)
 
-Drop:
-  User Request -> Proxy DropSnapshot -> DataCoord
-    -> SnapshotMeta.DropSnapshot()
-    -> Remove from Etcd
-    -> SnapshotWriter.Drop() (delete S3 files)
-    -> Remove from memory
+Drop (single snapshot):
+  User Request -> Proxy DropSnapshot(dbName, collectionName, snapshotName)
+    -> Proxy resolves collectionName → collectionID via MetaCache
+    -> DataCoord.DropSnapshot(collectionID, name)
+    -> Broadcast DropSnapshotMessage(collectionID, name) via WAL
+    -> DDL Callback: Mark DELETING → Remove from memory → Delete S3 → Drop catalog
+
+Drop (cascade on drop collection):
+  User Request -> Proxy DropCollection -> RootCoord
+    -> Step 2.5: Broadcast DropSnapshotsByCollection(collectionID) (best-effort)
+       -> DataCoord DDL Callback: iterate all snapshots, delete each via DropSnapshot
+    -> (Fallback: GC orphan detection catches missed snapshots)
 
 List:
   User Request -> Proxy ListSnapshots -> DataCoord
     -> SnapshotMeta.ListSnapshots()
-    -> Filter by collection/partition
+    -> Filter by collection/partition/database
 
 Describe:
   User Request -> Proxy DescribeSnapshot -> DataCoord
@@ -383,13 +552,12 @@ Describe:
     -> Return SnapshotInfo
 
 Restore:
-  User Request -> Proxy RestoreSnapshot -> RootCoord
-    -> DescribeSnapshot() from DataCoord (get schema, partitions, indexes)
-    -> CreateCollection() with PreserveFieldId=true
-    -> CreatePartition() for each user partition
-    -> RestoreSnapshotDataAndIndex() to DataCoord
-       -> Create indexes with PreserveIndexId=true
-       -> Create CopySegmentJob
+  User Request -> Proxy RestoreSnapshot -> DataCoord
+    -> Proxy resolves source collectionName → sourceCollectionID
+    -> DataCoord reads snapshot data using (sourceCollectionID, snapshotName)
+    -> DataCoord creates target collection via RootCoord (PreserveFieldId=true)
+    -> DataCoord creates partitions and indexes
+    -> DataCoord creates CopySegmentJob for data restoration
     -> Return job_id for async tracking
 ```
 
@@ -408,17 +576,13 @@ User Request
     │
     ▼
 ┌─────────┐
-│  Proxy  │  ← Entry point, request validation
+│  Proxy  │  ← Entry point, request validation, resolve sourceCollectionID
 └────┬────┘
      │
      ▼
 ┌───────────┐
-│ RootCoord │  ← Orchestration: CreateCollection, CreatePartition, coordinate DataCoord
-└─────┬─────┘
-      │
-      ▼
-┌───────────┐
-│ DataCoord │  ← Data restoration: CopySegmentJob creation, index creation
+│ DataCoord │  ← Orchestration: read snapshot, create collection via RootCoord,
+│           │    create indexes, create CopySegmentJob
 └─────┬─────┘
       │
       ▼
@@ -432,15 +596,37 @@ User Request
 #### Phase 1: Request Entry (Proxy Layer)
 
 ```
-1. Proxy RestoreSnapshotTask.Execute():
-   - Validates request parameters
-   - Delegates to RootCoord.RestoreSnapshot()
-   - RootCoord orchestrates the entire restore process
+1. Proxy RestoreSnapshotTask.PreExecute():
+   - Validates snapshot name
+   - Validates source collection_name (required)
+   - Validates target_collection_name (required)
+   - Resolves source collection_name → source_collection_id via MetaCache
+
+2. Proxy RestoreSnapshotTask.Execute():
+   - Delegates to DataCoord.RestoreSnapshot() with:
+     * source_collection_id (for per-collection snapshot lookup)
+     * target_db_name, target_collection_name
+```
+
+**Source-Target Collection Separation**:
+
+RestoreSnapshot distinguishes between the source collection (where the snapshot
+was created) and the target collection (where data will be restored to).
+`source_collection_id` is propagated through the entire chain:
+
+```
+Client(collectionName, targetCollectionName)
+  → Proxy: resolve collectionName → sourceCollectionID
+  → DataCoord RPC(sourceCollectionID, name, targetCollectionName)
+  → SnapshotManager: ReadSnapshotData(sourceCollectionID, snapshotName)
+  → WAL: RestoreSnapshotMessageHeader{SourceCollectionId}
+  → DDL Callback: RestoreData(sourceCollectionID, snapshotName, targetCollectionID)
 ```
 
 **Design Notes**:
-- Proxy layer is simplified to just delegate to RootCoord
-- All orchestration logic is centralized in RootCoord for better transactional control
+- Proxy layer validates both source and target collection names
+- Source collection must exist (snapshots are cascade-deleted with collection)
+- All orchestration logic is centralized in DataCoord
 
 #### Phase 2: Collection and Schema Recreation (RootCoord Layer)
 
@@ -513,19 +699,19 @@ message CopySegmentIDMapping {
 
 ```
 4. CopySegmentChecker monitors job execution:
-   
+
    Pending -> Executing:
    - Group segments by maxSegmentsPerCopyTask (currently default 10/group)
    - Create one CopySegmentTask for each group
    - Distribute tasks to DataNodes for execution
-   
+
    Executing:
    - DataNode CopySegmentTask executes:
      a. Read all file paths of source segment
      b. Copy files to new paths (update segment_id/partition_id/channel_name)
      c. Update segment's binlog/deltalog/indexfile information in meta
    - CopySegmentChecker monitors progress of all tasks
-   
+
    Executing -> Completed:
    - After all tasks complete
    - Update all target segments status to Flushed
@@ -537,7 +723,7 @@ message CopySegmentIDMapping {
 - **Current Implementation**: Supports task-level concurrency based on segment grouping
   - Create tasks grouped by maxSegmentsPerCopyTask (default 10 segments)
   - Each group generates independent CopySegmentTask, which can be distributed to different DataNodes for parallel execution
-  
+
   - **Long-term Optimization**: If copy performance is insufficient, implement concurrency acceleration at task level
     - **Adjust Grouping Granularity**: Reduce maxSegmentsPerCopyTask value to increase task count
       - Example: Reduce from 10 segments/task to 5 or fewer
@@ -595,6 +781,7 @@ message CopySegmentJob {
     int64 copied_segments = 14;
     int64 total_rows = 15;
     string snapshot_name = 16;                       // For restore snapshot scenario
+    int64 source_collection_id = 17;                 // Source collection ID for per-collection snapshot lookup
 }
 ```
 
@@ -773,6 +960,28 @@ Offline access through snapshot data on S3:
 
 ## API Reference
 
+### API Changes for Per-Collection Scoping
+
+All snapshot APIs now require collection context for per-collection name scoping.
+Proxy automatically fills `db_name` via database interceptor when not specified.
+
+| API | New Fields | Notes |
+|-----|-----------|-------|
+| DropSnapshotRequest | `int64 collection_id = 3` | Required. Proxy resolves from collection_name |
+| DescribeSnapshotRequest | `int64 collection_id = 4` | Required. Proxy resolves from collection_name |
+| ListSnapshotsRequest | `int64 db_id = 4` | Optional. Enables database-level aggregation |
+| ListRestoreSnapshotJobsRequest | `int64 db_id = 3` | Optional. Filter by database |
+| RestoreSnapshotInfo | `int64 db_id = 9` | Database ID of the target collection |
+| CopySegmentJob | `int64 source_collection_id = 17` | For per-collection snapshot lookup during restore |
+
+**WAL Message Changes**:
+
+| Message | New Fields |
+|---------|-----------|
+| DropSnapshotMessageHeader | `int64 collection_id = 2` |
+| RestoreSnapshotMessageHeader | `int64 source_collection_id = 4` |
+| DropSnapshotsByCollectionMessageHeader | New message type (`int64 collection_id = 1`) |
+
 ### CreateSnapshot
 
 **Function**: Create snapshot for specified collection, automatically export data to object storage
@@ -783,7 +992,7 @@ message CreateSnapshotRequest {
   common.MsgBase base = 1;
   string db_name = 2;               // database name
   string collection_name = 3;       // collection name
-  string name = 4;                  // user-defined snapshot name (unique)
+  string name = 4;                  // user-defined snapshot name (unique within collection)
   string description = 5;           // user-defined snapshot description
 }
 ```
@@ -815,7 +1024,8 @@ message CreateSnapshotResponse {
 ```protobuf
 message DropSnapshotRequest {
   common.MsgBase base = 1;
-  string name = 2;                  // snapshot name to drop
+  string name = 2;                  // snapshot name (unique within collection)
+  int64 collection_id = 3;          // collection id for per-collection name scoping
 }
 ```
 
@@ -827,9 +1037,11 @@ message DropSnapshotResponse {
 ```
 
 **Implementation Details**:
-1. Delete SnapshotInfo from Etcd
-2. Delete metadata file and all manifest files referenced in ManifestList from S3
-3. Remove reference relationships from memory
+1. Proxy resolves `collection_name` to `collection_id` before forwarding to DataCoord
+2. Delete SnapshotInfo from Etcd
+3. Delete metadata file and all manifest files referenced in ManifestList from S3
+4. Remove reference relationships from memory
+5. Idempotent: returns success if snapshot does not exist
 
 ### ListSnapshots
 
@@ -841,6 +1053,7 @@ message ListSnapshotsRequest {
   common.MsgBase base = 1;
   string db_name = 2;               // database name
   string collection_name = 3;       // collection name
+  int64 db_id = 4;                  // filter by database, 0 = no filter
 }
 ```
 
@@ -860,7 +1073,9 @@ message ListSnapshotsResponse {
 ```protobuf
 message DescribeSnapshotRequest {
   common.MsgBase base = 1;
-  string name = 2;                  // snapshot name
+  string name = 2;                  // snapshot name (unique within collection)
+  bool include_collection_info = 3;
+  int64 collection_id = 4;          // collection id for per-collection name scoping
 }
 ```
 
@@ -889,9 +1104,11 @@ message DescribeSnapshotResponse {
 ```protobuf
 message RestoreSnapshotRequest {
   common.MsgBase base = 1;
-  string name = 2;                  // snapshot name to restore
-  string db_name = 3;               // target database name
-  string collection_name = 4;       // target collection name (must not exist)
+  string name = 2;                       // snapshot name
+  string db_name = 3;                    // source database name
+  string collection_name = 4;            // source collection name (required)
+  string target_db_name = 6;             // target database name
+  string target_collection_name = 7;     // target collection name (required, must not exist)
 }
 ```
 
@@ -905,29 +1122,27 @@ message RestoreSnapshotResponse {
 
 **Internal API** (datapb - DataCoord API):
 ```protobuf
-// RestoreSnapshotDataAndIndex - Called by RootCoord after collection/partition creation
 message RestoreSnapshotRequest {
   common.MsgBase base = 1;
-  string name = 2;                  // snapshot name
-  int64 collection_id = 3;          // target collection ID (already created by RootCoord)
-  bool create_indexes = 4;          // whether to create indexes during restore
+  string name = 2;                       // snapshot name
+  string target_db_name = 3;             // target database name
+  string target_collection_name = 4;     // target collection name
+  int64 source_collection_id = 5;        // source collection ID (resolved by Proxy)
 }
 ```
 
 **Implementation Flow**:
-1. **Proxy**: Validates request and delegates to RootCoord
-2. **RootCoord** (orchestration):
-   - Get snapshot info from DataCoord (schema, partitions, indexes)
-   - Create new collection with PreserveFieldId=true
+1. **Proxy**: Validates source and target collection names, resolves source_collection_id
+2. **DataCoord** (orchestration):
+   - Read snapshot data using (source_collection_id, snapshot_name)
+   - Create new collection via RootCoord with PreserveFieldId=true
    - Create user partitions
-   - Call DataCoord.RestoreSnapshotDataAndIndex()
-   - Handle rollback on failure
-3. **DataCoord** (data restoration):
-   - Create indexes with PreserveIndexId=true (if requested)
+   - Create indexes with PreserveIndexId=true
    - Create CopySegmentJob for data recovery
-4. Return job_id for progress tracking
+3. Return job_id for progress tracking
 
 **Limitations**:
+- Source collection must exist (snapshots are cascade-deleted with collection)
 - Target collection must not exist
 - New collection's shard/partition count will match snapshot
 - Does not automatically handle TTL-related issues
@@ -960,6 +1175,7 @@ message RestoreSnapshotInfo {
   int32 progress = 6;               // 0-100
   string reason = 7;                // error reason if failed
   uint64 time_cost = 8;             // milliseconds
+  int64 db_id = 9;                  // database id of the target collection
 }
 ```
 
@@ -971,13 +1187,14 @@ message RestoreSnapshotInfo {
 
 ### ListRestoreSnapshotJobs
 
-**Function**: List all restore jobs (optionally filter by collection)
+**Function**: List all restore jobs (optionally filter by collection or database)
 
 **Request**:
 ```protobuf
 message ListRestoreSnapshotJobsRequest {
   common.MsgBase base = 1;
   string collection_name = 2;       // optional: filter by collection
+  int64 db_id = 3;                  // optional: filter by database, 0 = no filter
 }
 ```
 

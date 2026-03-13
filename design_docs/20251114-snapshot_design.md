@@ -561,6 +561,189 @@ Restore:
     -> Return job_id for async tracking
 ```
 
+## Compaction Protection
+
+### Overview
+
+Snapshots reference specific segments at creation time. If those segments are compacted (merged, reorganized, or upgraded) before a restore, the snapshot becomes unrestorable. Compaction protection prevents this by temporarily blocking compaction on snapshot-referenced segments for a user-specified duration.
+
+### API Parameter
+
+The `CreateSnapshot` API accepts an optional `compaction_protection_seconds` parameter:
+
+```protobuf
+message CreateSnapshotRequest {
+  common.MsgBase base = 1;
+  string name = 2;
+  string description = 3;
+  string db_name = 4;
+  string collection_name = 5;
+  int64 compaction_protection_seconds = 6;  // 0 = no protection, max = 604800 (7 days)
+}
+```
+
+**Validation (Proxy layer)**:
+- Must be >= 0 (negative values rejected)
+- Maximum 7 days (604800 seconds)
+- Value of 0 means no compaction protection (backward compatible)
+
+**Internal storage**: The relative duration is converted to an absolute Unix timestamp (`CompactionExpireTime`) and stored in `SnapshotInfo`:
+
+```go
+snapshotInfo.CompactionExpireTime = uint64(time.Now().Unix()) + uint64(compactionProtectionSeconds)
+```
+
+### Dual-Layer Protection Mechanism
+
+Compaction protection uses a dual-layer approach to handle the race condition between snapshot creation and RefIndex loading:
+
+```
+                    ┌─────────────────────────────────────┐
+                    │   Snapshot Created with Protection   │
+                    └──────────┬──────────────────────────┘
+                               │
+                ┌──────────────┴──────────────┐
+                │                             │
+        RefIndex NOT loaded              RefIndex loaded
+                │                             │
+                ▼                             ▼
+    ┌───────────────────────┐    ┌───────────────────────────┐
+    │ Layer 1: Collection   │    │ Layer 2: Segment-Level    │
+    │ Level Blocking        │    │ Expiry-Based Protection   │
+    │ (fail-closed)         │    │ (precise)                 │
+    │                       │    │                           │
+    │ Block ALL compaction  │    │ Block compaction only on  │
+    │ for the collection    │    │ referenced segments until │
+    │ until RefIndex loads  │    │ expiry time               │
+    └───────────────────────┘    └───────────────────────────┘
+```
+
+#### Layer 1: Collection-Level Fail-Closed Blocking
+
+**Problem**: When a snapshot is created with compaction protection, the RefIndex (which maps snapshot → segment IDs) may not yet be loaded. Without knowing which segments are protected, compaction could proceed on protected segments.
+
+**Solution**: Block all compaction for the entire collection until the RefIndex is loaded.
+
+**Implementation**:
+```go
+type snapshotMeta struct {
+    // Collections where compaction is blocked due to unloaded RefIndex
+    compactionBlockedCollections typeutil.UniqueSet
+}
+
+func (sm *snapshotMeta) IsCollectionCompactionBlocked(collectionID int64) bool {
+    return sm.compactionBlockedCollections.Contain(collectionID)
+}
+```
+
+**Lifecycle**:
+1. On DataCoord startup, `rebuildAllSegmentProtection()` scans all snapshots
+2. For each snapshot with active protection (`CompactionExpireTime > now`) but unloaded RefIndex → add collection to blocked set
+3. When `refIndexLoaderLoop()` loads the RefIndex → rebuild protection, remove from blocked set
+4. Result: fail-closed during the loading gap, precise protection after
+
+#### Layer 2: Segment-Level Expiry-Based Protection
+
+**Problem**: Once RefIndex is loaded, we know exactly which segments the snapshot references. Blocking the entire collection is unnecessarily broad.
+
+**Solution**: Track per-segment protection expiry timestamps.
+
+**Implementation**:
+```go
+type snapshotMeta struct {
+    segmentProtectionMu    sync.RWMutex
+    segmentProtectionUntil map[int64]uint64  // segmentID → expiry Unix timestamp
+}
+
+func (sm *snapshotMeta) IsSegmentCompactionProtected(segmentID int64) bool {
+    sm.segmentProtectionMu.RLock()
+    defer sm.segmentProtectionMu.RUnlock()
+    expiryTs, exists := sm.segmentProtectionUntil[segmentID]
+    if !exists {
+        return false
+    }
+    return uint64(time.Now().Unix()) < expiryTs
+}
+```
+
+**Multi-snapshot handling**: When multiple snapshots protect the same segment, the latest expiry wins:
+```go
+func (sm *snapshotMeta) upsertMaxProtection(segID int64, protectionUntil uint64) {
+    if existing, ok := sm.segmentProtectionUntil[segID]; !ok || protectionUntil > existing {
+        sm.segmentProtectionUntil[segID] = protectionUntil
+    }
+}
+```
+
+### Compaction Policy Integration
+
+All five compaction paths are protected with both layers:
+
+| Compaction Policy | Collection-Level Check | Segment-Level Check |
+|-------------------|----------------------|---------------------|
+| Single (L0→L1 merge) | `Trigger()`, `triggerOneCollection()` | SegmentFilterFunc |
+| Clustering | `Trigger()`, `triggerOneCollection()` | SegmentFilterFunc |
+| Force Merge | `triggerOneCollection()` | SegmentFilterFunc |
+| Storage Version | `Trigger()`, `triggerOneCollection()` | SegmentFilterFunc |
+| Compaction Trigger (candidates) | `getCandidates()` | Default filter |
+
+**Check pattern** (uniform across all policies):
+```go
+// Layer 1: Skip entire collection if blocked
+if policy.meta.isCollectionCompactionBlocked(collection.ID) {
+    log.Info("skip compaction: unloaded protected snapshot RefIndex")
+    continue
+}
+
+// Layer 2: Filter out protected segments
+filterFunc := func(seg *SegmentInfo) bool {
+    return !policy.meta.isSegmentCompactionProtected(seg.GetID())
+}
+```
+
+### Protection Lifecycle
+
+**On Snapshot Creation**:
+```
+1. Proxy validates compaction_protection_seconds ∈ [0, 604800]
+2. DataCoord computes CompactionExpireTime = now + protectionSeconds
+3. SnapshotMeta.SaveSnapshot():
+   a. Persist SnapshotInfo with CompactionExpireTime
+   b. updateSegmentProtection() → update segmentProtectionUntil map
+   c. On failure → rebuildSegmentProtection() to rollback
+```
+
+**On DataCoord Restart / RefIndex Load**:
+```
+1. refIndexLoaderLoop() loads pending RefIndexes
+2. rebuildAllSegmentProtection():
+   a. Clear all protection maps
+   b. For each snapshot with active protection:
+      - RefIndex NOT loaded → add collection to compactionBlockedCollections
+      - RefIndex loaded → updateSegmentProtection() for each segment
+```
+
+**On Snapshot Deletion**:
+```
+1. Collect protected segment IDs (if RefIndex loaded)
+2. Remove snapshot from memory and catalog
+3. rebuildSegmentProtection(segmentIDs):
+   - Clear protection for affected segments
+   - Recompute from remaining snapshots that reference these segments
+```
+
+**On Protection Expiry**:
+- No active cleanup needed — `IsSegmentCompactionProtected()` checks `now < expiryTs` at query time
+- Expired entries are naturally cleaned up during `rebuildAllSegmentProtection()` or `rebuildSegmentProtection()`
+
+### Configuration and Limits
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Max protection duration | 7 days (604800s) | Prevents long-term compaction blocking |
+| Default protection | 0 (disabled) | Backward compatible |
+| Validation location | Proxy PreExecute | Fail-fast before reaching DataCoord |
+
 ## Restore Snapshot Implementation
 
 ### Overview

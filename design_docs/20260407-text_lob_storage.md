@@ -428,9 +428,6 @@ System / integration:
 - Failure recovery: kill QueryNode mid-ingest; restart, replay WAL from
   the last reported `MsgPosition`, and verify the segment converges
   without data loss or duplication.
-- ETag allocator concurrency: two compactors / writers racing on
-  `_next_id` against MinIO and S3; verify all `file_id`s are unique
-  and no writer wedges.
 - Import (CSV / JSON / Parquet) of large TEXT values; verify produced
   segments have the same on-disk shape as inserted ones.
 - Python E2E suite: `tests/python_client/testcases/test_text_lob.py`.

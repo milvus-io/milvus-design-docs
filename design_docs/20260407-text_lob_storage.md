@@ -346,8 +346,17 @@ hole_ratio = 1 - total_refs / total_rows
   files with dense `row_offset`s starting from 0. Old LOB files lose
   references and are reclaimed by GC.
 
-`MixCompaction` defaults to REUSE_ALL; `clustering` and `sort` follow the
-same decision logic.
+Some compaction kinds bypass the hole-ratio decision and force a fixed
+strategy because their data movement is predetermined:
+
+- **Clustering compaction**: always REWRITE_ALL — data is repartitioned
+  across the output segments, so LOB references cannot be reused as-is.
+- **Mix compaction with split (1 → N)**: always REWRITE_ALL — rows are
+  redistributed across multiple output segments.
+- **Sort compaction**: always REUSE_ALL — only row order changes, the
+  underlying byte content of each row is unchanged, so reference rows
+  can be byte-copied into the output.
+- **Plain mix compaction (N → 1)**: uses the hole-ratio decision above.
 
 ### Garbage collection
 

@@ -1,6 +1,7 @@
 # MEP: commit_timestamp for Correct MVCC/TTL/GC on Import and CDC Segments
 
 - **Created:** 2026-03-24
+- **Updated:** 2026-04-08
 - **Author(s):** @bigsheeper
 - **Status:** Under Review
 - **Component:** DataCoord | QueryNode | DataNode | Storage
@@ -9,22 +10,22 @@
 
 ## Summary
 
-Add a `commit_timestamp` field to `SegmentInfo` (DataCoord) and `SegmentLoadInfo` (QueryCoord → QueryNode → C++ segcore). When non-zero, `commit_timestamp` is the effective transaction time for the segment, overriding `start_position.Timestamp` / `dml_position.Timestamp` for all temporal decisions: MVCC snapshot visibility, GC eligibility, TTL compaction triggering, and delete-buffer anchoring.
+Add a `commit_timestamp` field to `SegmentInfo` (DataCoord) and `SegmentLoadInfo` (QueryCoord → QueryNode → C++ segcore). When non-zero, `commit_timestamp` is the effective transaction time for the segment, overriding `start_position.Timestamp` / `dml_position.Timestamp` for all temporal decisions: MVCC snapshot visibility, GC eligibility, collection-level TTL compaction triggering, and delete-buffer anchoring.
+
+`commit_timestamp` is a **temporary state**: it exists only between import and the first compaction. Compaction normalizes import segments by rewriting row timestamps to `commit_ts` in output binlogs and clearing `CommitTimestamp` to 0.
 
 ## Motivation
 
-When Milvus imports a bulk-load batch (or replays CDC), each row carries its original `row.timestamp` from the source system — which may be hours, days, or years old. Every time-based check in the system uses `start_position.Timestamp` or `dml_position.Timestamp` (derived from these old row timestamps), seeing `T_old` instead of the actual commit time `T_commit`. This produces a family of correctness bugs:
+When Milvus imports a bulk-load batch (or replays CDC), each row carries a timestamp generated during the import process. These timestamps may be slightly older than the actual commit time. Every time-based check in the system uses `start_position.Timestamp` or `dml_position.Timestamp` (derived from these outdated row timestamps), seeing `T_old` instead of the actual commit time `T_commit`. This produces a family of correctness bugs:
 
 | Bug | Root cause |
 |-----|-----------|
 | Snapshot over-inclusion | `GenSnapshot` filters by `start_position.Timestamp`; import segment with `T_old=1000` appears at `snapshotTs=3000` before it was logically committed at `T_commit=5000` |
 | Premature L0 compaction | L0 target selection uses `start_position.Timestamp`; import segment is eligible for L0 runs before `T_commit` |
-| Wrong TTL trigger | TTL compaction trigger uses `binlog.TimestampFrom/TimestampTo`; import binlogs with old row timestamps look expired immediately after `isImporting` is cleared |
-| Wrong TTL query masking | C++ `mask_with_timestamps` uses raw `row.ts` for TTL; import rows with `row.ts = T_old` are falsely expired in live queries |
+| Wrong TTL trigger | Collection-level TTL compaction trigger uses `binlog.TimestampFrom/TimestampTo`; import binlogs with outdated row timestamps look expired immediately after `isImporting` is cleared |
 | Wrong MVCC visibility | C++ `mask_with_timestamps` uses raw `row.ts` for MVCC; a query at `mvcc_ts = T_mid` (where `T_old < T_mid < T_commit`) can see import rows that should be invisible until `T_commit` |
-| Premature GC | GC eligibility uses `dml_position.Timestamp`; recently committed import segment with old `dml_position` may be garbage-collected |
+| Premature GC | GC eligibility uses `dml_position.Timestamp`; recently committed import segment with outdated `dml_position` may be garbage-collected |
 | Wrong channel truncation | `TruncateChannelByTime` drops segments by `dml_position.Timestamp`; import segment dropped prematurely |
-| Delete leakage | Delete-buffer anchor uses `start_position.Timestamp = T_old`; deletes issued between `T_old` and `T_commit` may be incorrectly applied to import rows |
 
 ## Public Interfaces
 
@@ -41,7 +42,8 @@ uint64 commit_timestamp = 35;
 **`pkg/proto/query_coord.proto` — `SegmentLoadInfo`:**
 ```protobuf
 // commit_timestamp mirrors data_coord.SegmentInfo.commit_timestamp.
-// Used by QueryNode for delete-buffer pinning and ListAfter calls.
+// QueryNode uses it for: delete-buffer pinning, ListAfter calls, and
+// passing to C++ segcore to overwrite the in-memory timestamp column.
 uint64 commit_timestamp = 25;
 ```
 
@@ -87,21 +89,47 @@ func segmentEffectiveDmlTs(seg *datapb.SegmentInfo) uint64 {
 }
 ```
 
-### When `commit_timestamp` Is Set
-
-`commit_timestamp` is set **atomically** with `isImporting = false` in `import_checker.go:unsetSegmentImporting()`. Both fields are written to the same `SegmentInfo` proto key in a single `MultiSave` etcd transaction. There is no window where `isImporting=false` but `commit_timestamp=0` can be observed by any observer.
+An additional helper for computing effective row timestamps:
 
 ```go
-nowTs, _ := c.alloc.AllocTimestamp(c.ctx)
-c.meta.UpdateSegmentsInfo(c.ctx,
-    UpdateIsImporting(segmentID, false),
-    UpdateCommitTimestamp(segmentID, uint64(nowTs)),
-)
+// effectiveTimestamp returns max(rawTs, commitTs) when commitTs is non-zero.
+func effectiveTimestamp(rawTs, commitTs uint64) uint64 {
+    if commitTs != 0 && commitTs > rawTs {
+        return commitTs
+    }
+    return rawTs
+}
 ```
 
-### When `commit_timestamp` Is Cleared
+### When `commit_timestamp` Is Set
 
-After major compaction rewrites all row timestamps, the output segment has `commit_timestamp = 0` (proto zero value). No explicit clearing is needed.
+TODO: Will be assigned by a 2PC commit flow in a companion PR. Currently `import_checker.go` has a placeholder.
+
+### When `commit_timestamp` Is Cleared — Compaction Normalization
+
+`commit_timestamp` is a **temporary state** that only exists between import and the first compaction. During compaction:
+
+1. **All compaction paths** (mix, sort, clustering) rewrite row timestamps in output binlogs to `commit_ts` for rows from import segments.
+2. **Completion mutations** in `meta.go` set `CommitTimestamp = 0` on the output segment and update `StartPosition`/`DmlPosition` timestamps via `normalizePositionTimestamp`.
+3. After compaction, the segment is a **normal segment** with no special handling needed.
+
+This design minimizes the surface area of `if commitTs != 0` checks — they only apply to segments between import and first compaction.
+
+**Implementation:** `timestamp_overwrite.go` provides `overwriteRecordTimestamps` (wraps Arrow Record) and `wrapReaderWithTimestampOverwrite` (wraps RecordReader) to transparently overwrite timestamps in compaction data paths.
+
+### TTL Handling
+
+**Per-row TTL field:** NOT affected by `commit_ts`. TTL field values represent the user's explicit expiration intent and are honored as-is, regardless of whether the segment is imported. No special handling needed.
+
+**Collection-level TTL:** Uses `effectiveTimestamp(row_ts, commit_ts)` = `max(row_ts, commit_ts)` as the effective row age, preventing premature expiration of import segments with outdated row timestamps.
+
+### Delete and Upsert Handling
+
+A delete or upsert with `ts < commit_ts` does **NOT** take effect on the import segment. Since row timestamps are overwritten to `commit_ts` at load time, the original `search_pk(pk, delete_ts)` logic naturally handles this:
+- `delete_ts < commit_ts` → `row_ts (= commit_ts) > delete_ts` → row not found → delete skipped ✓
+- `delete_ts >= commit_ts` → `row_ts (= commit_ts) <= delete_ts` → row found → delete applied ✓
+
+No special-case code is needed in the delete-apply callback.
 
 ### DataCoord Fix Sites
 
@@ -111,7 +139,8 @@ After major compaction rewrites all row timestamps, the output segment has `comm
 | `compaction_task_l0.go` | L0 target selection | `info.GetStartPosition().GetTimestamp()` | `segmentEffectiveTs(info.SegmentInfo)` |
 | `meta.go` | `TruncateChannelByTime` | `segment.GetDmlPosition().GetTimestamp()` | `segmentEffectiveDmlTs(segment.SegmentInfo)` |
 | `garbage_collector.go` | GC eligibility | `segment.GetDmlPosition().GetTimestamp()` | `segmentEffectiveDmlTs(segment.SegmentInfo)` |
-| `compaction_trigger.go` | TTL trigger | `binlog.TimestampTo / TimestampFrom` | `max(binlogTs, commit_ts)` for both fields |
+| `compaction_trigger.go` | TTL trigger | `binlog.TimestampTo / TimestampFrom` | `effectiveTimestamp(binlogTs, commit_ts)` |
+| `meta.go` | Compaction completion | Propagate `commit_ts` | Set `CommitTimestamp = 0`, normalize positions |
 
 ### QueryNode Fix Sites
 
@@ -132,9 +161,9 @@ Applied at 4 call sites in `delegator_data.go`:
 - `deleteBuffer.ListAfter(segmentEffectiveTs(info))` — replay deletes since commit time
 - `catchUpTs = segmentEffectiveTs(info)` — snapshot catch-up for empty-snapshot case
 
-### C++ Segcore: Approach A (Timestamp Column Overwrite at Load Time)
+### C++ Segcore: Timestamp Column Overwrite at Load Time
 
-**Rationale:** Overwriting `row.ts → commit_ts` during `LoadFieldData` makes the existing `mask_with_timestamps` (MVCC + TTL) and delete filtering work correctly without any modification to the query hot path.
+**Rationale:** Overwriting `row.ts → commit_ts` during `LoadFieldData` makes the existing `mask_with_timestamps` (MVCC) and delete filtering work correctly without any modification to the query hot path.
 
 **Implementation:** In `ChunkedSegmentSealedImpl`, `commit_ts_` is set from the deserialized proto in `SetLoadInfo`. Two loading paths (`load_system_field_internal` for storage v1, `load_column_group_data_internal` for storage v2) overwrite the timestamp vector with `std::fill(commit_ts_)` when `commit_ts_ != 0`:
 
@@ -160,11 +189,12 @@ if (commit_ts_ != 0) {
 | Check | Condition | Result |
 |-------|-----------|--------|
 | MVCC visibility | `row.ts > mvcc_ts` | Invisible for `mvcc_ts < commit_ts`, visible for `mvcc_ts ≥ commit_ts` ✓ |
-| TTL expiry | `row.ts ≤ collection_ttl` | Uses `commit_ts` as logical age ✓ |
-| Delete (pre-commit, query_ts < commit_ts) | row invisible by MVCC | Delete irrelevant ✓ |
-| Delete (post-commit, query_ts ≥ commit_ts) | row visible | Delete applied by timestamp ✓ |
+| Collection-level TTL | `effectiveTimestamp(row.ts, commit_ts)` | Uses `commit_ts` as logical age ✓ |
+| Per-row TTL field | `current_time >= ttl_field_value` | Honored as-is — user expiration intent ✓ |
+| Delete (ts < commit_ts) | `search_pk(pk, delete_ts)` → row not found | Delete correctly skipped ✓ |
+| Delete (ts >= commit_ts) | `search_pk(pk, delete_ts)` → row found | Delete correctly applied ✓ |
 
-**Trade-off:** Original `row.ts` values are no longer visible in the in-memory segment. They remain intact in on-disk binlogs. After compaction, `commit_ts` is baked as the physical row timestamp — semantically correct for a non-import segment.
+**Trade-off:** Original `row.ts` values are no longer visible in the in-memory segment. They remain intact in on-disk binlogs until compaction. After compaction, `commit_ts` is baked as the physical row timestamp and `CommitTimestamp` is cleared — the segment becomes a normal segment.
 
 **`SegmentGrowingImpl` is unaffected:** Growing segments receive rows from live DML where `row.ts ≈ current_timetick`. The `T_old ≪ T_commit` gap cannot occur.
 
@@ -181,6 +211,20 @@ DataCoord:SegmentInfo.commit_timestamp
   → LoadFieldData: std::fill(timestamps, commit_ts_)
 ```
 
+### Compaction Normalization Chain
+
+```
+Input segments with CommitTimestamp != 0
+  → DataNode compactor reads rows
+  → timestamp_overwrite.go: overwriteRecordTimestamps / wrapReaderWithTimestampOverwrite
+  → Row timestamps rewritten to commit_ts in output binlogs
+  → TimestampFrom/TimestampTo in output binlogs reflect commit_ts
+  → DataCoord completion mutation:
+    → CommitTimestamp = 0
+    → StartPosition/DmlPosition normalized via normalizePositionTimestamp
+  → Output segment is a normal segment
+```
+
 ### Sites Confirmed Safe (No Change Needed)
 
 | Site | Reason |
@@ -190,7 +234,6 @@ DataCoord:SegmentInfo.commit_timestamp
 | `segment_allocation_policy.go` | Growing-segment sealing logic; import segments already sealed |
 | `compaction_task_mix.go`, `compaction_task_clustering.go` | Neither uses `start_position.Timestamp` for selection |
 | `delegator_data.go:854` `zap.Time` log field | Diagnostic output only |
-| `compaction_trigger.go` `ShouldCompactExpiryWithTTLField` | Uses `GetExpirQuantiles()` (physical wall-clock); returns false for import segments which have no quantiles |
 
 ## Compatibility, Deprecation, and Migration Plan
 
@@ -206,17 +249,23 @@ DataCoord:SegmentInfo.commit_timestamp
 - `TestGenSnapshot_ImportSegment_*` — excluded before commit_ts, included after
 - `TestDeleteBuffer_PinsAtCommitTs` — delete buffer anchor uses commit_ts, not start_position.ts
 - `Test_compactionTrigger_shouldDoSingleCompaction_CommitTimestamp` — TTL trigger uses commit_ts for import segments
-- `TestUnsetSegmentImporting_SetsCommitTimestampAtomically` — atomic set verification
+- `TestOverwriteRecordTimestamps_*` / `TestWrapReaderWithTimestampOverwrite_*` — timestamp overwrite utilities
 
 **C++ tests (`test_commit_timestamp.cpp`):**
 - `MVCC_RowsInvisibleBeforeCommitTs` — queries at `ts < commit_ts` see 0 rows; queries at `ts ≥ commit_ts` see all rows
 - `TTL_RowsNotExpiredWhenCommitTsAboveTtl` — import segment not TTL-expired when `commit_ts > ttl_threshold`; control (no overwrite) correctly expires
-- `Delete_PreCommitDeleteAppliedAfterCommit` — MVCC masks rows before commit_ts; delete applies correctly after commit_ts
+- `Delete_PreCommitDeleteNotApplied` — delete at `ts < commit_ts` does NOT apply because row did not exist at delete time
 - `NormalSegment_BehaviorUnchanged` — segments with `commit_ts=0` behave identically to pre-change
 
 **Integration tests (`CommitTimestampSuite`):**
-- `TestImport_CommitTimestampSetAfterCompletion` — after bulk-insert import completes, all segments have `CommitTimestamp > 0`
-- `TestImport_DataQueryableAfterCommit` — Strong-consistency query returns all imported rows after import
+- `TestS4_MVCC_Visibility` — MVCC query before/after commit_ts
+- `TestS5_Delete_OnImportSegment` — delete after commit_ts takes effect
+- `TestS6_Upsert_OnImportSegment` — upsert after commit_ts takes effect
+- `TestS7_Delete_BeforeCommitTs` — delete before commit_ts does NOT take effect
+- `TestS8_Upsert_BeforeCommitTs` — upsert before commit_ts does NOT take effect
+- `TestS2_Compaction_PreservesCommitTs` — compaction output has `CommitTimestamp = 0` (normalized)
+- `TestImport_CommitTimestampSetAfterCompletion` — after import, all segments have `CommitTimestamp > 0`
+- `TestImport_DataQueryableAfterCommit` — Strong-consistency query returns all imported rows
 
 ## Rejected Alternatives
 
@@ -233,7 +282,7 @@ mask[i] = effective_ts > timestamp;
 - Adds a branch + conditional max to every row in every query — measurable hot-path overhead.
 - Requires changes in both the MVCC lambda and the TTL lambda, increasing the blast radius.
 - Still does not fix the DataCoord-side bugs (snapshot, GC, compaction trigger) — those need the `segmentEffectiveTs` helpers regardless.
-- The load-time overwrite (Approach A) achieves the same correctness with zero query hot-path overhead and a single implementation point.
+- The load-time overwrite achieves the same correctness with zero query hot-path overhead and a single implementation point.
 
 ### Approach C: Dual-timestamp segment (store both `row.ts` and `commit_ts`)
 
@@ -242,7 +291,7 @@ Keep original `row.ts` intact; thread `commit_ts` as a separate per-segment valu
 **Rejected because:**
 - Every temporal decision site needs to be aware of two timestamps and pick the right one — far larger diff, higher risk of missed sites.
 - No query semantics require access to the original `row.ts` after commit. The in-memory value is transient.
-- Original `row.ts` is preserved on disk in binlogs if needed for future use.
+- Original `row.ts` is preserved on disk in binlogs until compaction.
 
 ## References
 

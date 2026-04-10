@@ -98,10 +98,16 @@ collection.query(
     output_fields=["message", "timestamp"]
 )
 
-# JSON field regex
+# JSON field regex — must use path specifier, not root node
 collection.query(
     expr='metadata["tag"] =~ "v[0-9]+\\.[0-9]+"',
     output_fields=["metadata"]
+)
+
+# Array<VARCHAR> field — must specify element index
+collection.query(
+    expr='tags[0] =~ "release-v[0-9]+"',
+    output_fields=["tags"]
 )
 
 # Combined with vector search
@@ -163,7 +169,7 @@ enum OpType {
 
 `VisitRegexNotMatch` reuses `VisitRegexMatch` and wraps the result with a `NOT` expression. No separate `RegexNotMatch` OpType is needed.
 
-Unlike `LIKE`, the regex pattern is not decomposed into sub-operations (PrefixMatch, InnerMatch, etc.). It is passed through as-is.
+Before emitting `RegexMatch`, the parser attempts to optimize simple patterns to faster LIKE operations (see Section 5 below). Only patterns that cannot be optimized remain as `RegexMatch`.
 
 ### 2. Execution Engine
 
@@ -181,8 +187,8 @@ This contrasts with the existing `RegexMatcher` which uses `RE2::FullMatch` (use
 
 The `RegexMatch` op is integrated into the `UnaryExpr` execution pipeline:
 
-- **Raw data path**: For each row, apply `PartialRegexMatcher` to produce a boolean result. The matcher is constructed once per batch (RE2 compilation), then reused across all rows.
-- **Scalar index path**: Use `Reverse_Lookup` to retrieve raw values from the index, then apply `PartialRegexMatcher`. Direct index-level acceleration via tantivy `regex_query` is not used because tantivy implements full-string matching, which is incompatible with substring semantics.
+- **Raw data path**: For each row, apply `PartialRegexMatcher` to produce a boolean result. The matcher is constructed once per batch (RE2 compilation), then reused across all rows. For JSON shared-data paths, a pre-built `PartialRegexMatcher` is stored in `UnaryCompareContext` to avoid per-row RE2 compilation.
+- **Scalar index path**: Indexes that support `PatternMatch()` (Sort, Marisa, Bitmap, Inverted) iterate unique values and apply matching, which is O(unique\_values) instead of O(total\_rows). For inverted index (tantivy), the regex pattern is converted to tantivy-compatible syntax (`.` → `[\s\S]` for dot\_nl alignment, wrapped with `[\s\S]*(?:...)[\s\S]*` for substring semantics) and executed via `regex_query` on the term dictionary.
 - **Execution ordering**: `RegexMatch` is classified as a "heavy" operation (same as `LIKE`), so it is reordered after cheaper indexed expressions in conjunctive filters.
 
 ### 3. Index Optimization: Ngram Index (Primary Path)
@@ -253,24 +259,28 @@ Regex filtering should work with all index types that support LIKE, using the sa
 |------------|-------------|----------------------|
 | **No index (brute force)** | RE2 FullMatch on raw data | RE2 PartialMatch on raw data |
 | **Ngram index** | Two-phase: ngram filter + LIKE verify | Two-phase: ngram filter (literal extraction) + RE2 PartialMatch verify |
-| **Inverted index (tantivy)** | PatternQuery (LIKE→regex→FST) | Wrap pattern as `.*pattern.*` and call `regex_query` (slow but correct), or fallback to Reverse_Lookup + RE2 PartialMatch |
-| **Sort index (StringIndexSort)** | PrefixMatch via range query | Fallback to Reverse_Lookup + RE2 PartialMatch (no range optimization for arbitrary regex) |
-| **Marisa index (StringIndexMarisa)** | PatternMatch dispatch | Fallback to Reverse_Lookup + RE2 PartialMatch |
-| **Bitmap index** | PatternMatch/PatternQuery | Fallback to Reverse_Lookup + RE2 PartialMatch |
+| **Inverted index (tantivy)** | PatternQuery (LIKE→regex→FST) | Convert `.` → `[\s\S]` for dot\_nl alignment, wrap with `[\s\S]*(?:...)[\s\S]*` for substring semantics, call `regex_query` on term dictionary. Iterates unique values via FST intersection. |
+| **Sort index (StringIndexSort)** | PrefixMatch via range query | Iterate unique values with RE2 PartialMatch, union posting lists of matches. O(unique\_values). |
+| **Marisa index (StringIndexMarisa)** | PatternMatch dispatch | Iterate unique trie keys with RE2 PartialMatch, union row offsets. O(unique\_values). |
+| **Bitmap index** | PatternMatch/PatternQuery | Iterate unique keys with RE2 PartialMatch, union bitmaps. O(unique\_values). |
+
+All index types that support `PatternMatch()` iterate unique values rather than per-row `Reverse_Lookup`, making regex on indexed fields O(unique\_values) instead of O(total\_rows).
 
 For non-ngram indexes, the regex-to-LIKE optimization (Section 5) is important: simple patterns like `"^prefix"` are converted to `PrefixMatch` which can leverage sort index range queries and inverted index prefix queries natively.
 
 ### 7. Supported Field Types
 
-Regex supports the same field types as LIKE:
+Regex supports the same field types and access patterns as LIKE:
 
-| Field Type | Support | Notes |
-|------------|---------|-------|
-| VARCHAR | Yes | Primary use case |
-| JSON (string path) | Yes | e.g., `metadata["key"] =~ "pattern"`. Uses JSON pointer extraction + brute-force or index query |
-| Array\<VARCHAR\> | Yes | Element-level matching. Each array element is matched independently |
-| JSON (array of strings) | No | Same as LIKE — not supported for JSON array types |
-| INT/FLOAT/BOOL/other | No | Rejected at parse time |
+| Field Type | Syntax | Notes |
+|------------|--------|-------|
+| VARCHAR | `field =~ "pattern"` | Primary use case |
+| JSON (string path) | `metadata["key"] =~ "pattern"` | Requires JSON path specifier. `JSONField =~ "..."` on the root node is accepted by the parser but its behavior is undefined — always use a path like `JSONField["key"]`. |
+| Array\<VARCHAR\> (indexed) | `arr[0] =~ "pattern"` | Matches the element at the specified index, same as LIKE. Does NOT match "any element" — an explicit index is required. |
+| JSON (array of strings) | N/A | Not supported, same as LIKE |
+| INT/FLOAT/BOOL/other | N/A | Rejected at parse time |
+
+**Note on Array\<VARCHAR\>**: The `=~` operator on arrays follows the same semantics as LIKE — the user must specify an element index (e.g., `arr[0]`). "Match if any element matches" is not supported in V1. This is consistent with the existing LIKE behavior.
 
 ---
 

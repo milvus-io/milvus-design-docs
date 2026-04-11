@@ -351,11 +351,11 @@ Tantivy's `RegexQuery` uses FST+Automaton intersection for regex matching on the
 - [x] **Brute-force regex (no index)**: Raw data scan path verified via C++ UT on growing segments. RE2 PartialMatch on every row works correctly.
 - [x] **Sealed segment verification**: Analysis confirmed sealed and growing segments share the same UnaryExpr execution path. Growing segment UT provides coverage.
 - [x] **All index types support regex**: All index types that support LIKE now support `=~`:
-  - Inverted index (tantivy): RegexMatch intentionally not handled in PatternMatch (no Reverse_Lookup support); gated to raw-data path by CanUseIndexForOp
-  - Sort index (StringIndexSort): Reverse_Lookup + PartialRegexMatcher (both Memory and Mmap impl)
-  - Marisa index (StringIndexMarisa): Reverse_Lookup + PartialRegexMatcher
-  - Bitmap index: PartialRegexMatcher iteration over unique keys (all three build modes)
-  - Ngram index: two-phase literal extraction + RE2 PartialMatch verification
+  - Inverted index (tantivy): PatternMatch converts `.` → `[\s\S]`, wraps for substring semantics, calls `regex_query` on term dictionary
+  - Sort index (StringIndexSort): unique-value iteration with PartialRegexMatcher (both Memory and Mmap impl)
+  - Marisa index (StringIndexMarisa): unique-value iteration with PartialRegexMatcher
+  - Bitmap index: unique-value iteration with PartialRegexMatcher (all three build modes)
+  - Ngram index: two-phase literal extraction (with group penetration, quantifier expansion) + RE2 PartialMatch verification
 - [ ] **E2E integration tests**: Python pymilvus end-to-end tests:
   - Create collection → insert → query with `=~` and `!~` → verify results
   - Test with no index, inverted index, ngram index configurations
@@ -383,7 +383,7 @@ Tantivy's `RegexQuery` uses FST+Automaton intersection for regex matching on the
 - [ ] **Alternation OR splitting for ngram**: Currently `abc|xyz` bails out of ngram entirely. Optimization: split on top-level `|`, extract literals from each branch independently, query ngrams per branch, OR the candidate bitmaps. Requires changing `ExecutePhase1` from a single `vector<string>` (AND) to `vector<vector<string>>` (OR of ANDs). Ref: ClickHouse `analyzeImpl()` extracts `alternatives` and tests them individually.
 - [ ] **Brute-force pre-filter (Volnitsky-style)**: When no ngram index exists, extract a required literal from the regex and use `string::find` to pre-filter rows before running RE2. ClickHouse uses the Volnitsky algorithm (bigram hash table, 64KB L2-cache-friendly, 10-100x faster than `strstr`) for this. Milvus can start with `string::find` and optionally adopt Volnitsky later for further speedup. This avoids running the RE2 engine on rows that obviously don't contain the required literal.
 - [ ] **Hyperscan multi-pattern optimization**: When multiple regex filters target the same field (e.g., `field =~ "pattern_a" || field =~ "pattern_b"` or `field =~ "pattern_a" && field =~ "pattern_b"`), compile all patterns into a single Hyperscan DFA and scan each row once. O(n) regardless of pattern count, vs O(n×k) for k independent RE2 evaluations. Requires an expression optimization pass to detect multi-regex conjunctions/disjunctions on the same field and batch them. Ref: ClickHouse uses Hyperscan for `multiMatchAny()`.
-- [ ] **Group penetration for literal extraction**: Currently `abc(de)fg` skips the group, extracting `["abc", "fg"]` instead of `"abcdefg"`. For non-optional groups without alternation, the group content is sequential and required — it can be merged into the surrounding literal. ClickHouse's `analyzeImpl()` does this by recursing into groups and checking the quantifier after `)`: optional (`?`, `*`, `{0,...}`) → skip; required (no quantifier, `+`, `{1,...}`) → merge.
+- [x] ~~**Group penetration for literal extraction**~~: Implemented. `abc(de)fg` now extracts `"abcdefg"`. Non-optional groups are penetrated; optional groups (`?`, `*`, `{0,...}`) are skipped.
 
 ---
 

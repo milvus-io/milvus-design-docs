@@ -275,7 +275,7 @@ Regex supports the same field types and access patterns as LIKE:
 | Field Type | Syntax | Notes |
 |------------|--------|-------|
 | VARCHAR | `field =~ "pattern"` | Primary use case |
-| JSON (string path) | `metadata["key"] =~ "pattern"` | Requires JSON path specifier. `JSONField =~ "..."` on the root node is accepted by the parser but its behavior is undefined — always use a path like `JSONField["key"]`. |
+| JSON (string path) | `metadata["key"] =~ "pattern"` | Requires JSON path specifier. `JSONField =~ "..."` on the root node is accepted (consistent with LIKE) but only matches when the JSON value itself is a bare string — object/array roots return false. |
 | Array\<VARCHAR\> (indexed) | `arr[0] =~ "pattern"` | Matches the element at the specified index, same as LIKE. Does NOT match "any element" — an explicit index is required. |
 | JSON (array of strings) | N/A | Not supported, same as LIKE |
 | INT/FLOAT/BOOL/other | N/A | Rejected at parse time |

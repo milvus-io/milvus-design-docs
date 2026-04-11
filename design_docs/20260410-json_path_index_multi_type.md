@@ -280,7 +280,7 @@ This is a hard reject at index metadata creation time. During rolling upgrade, A
         │                                                                   │
         │  PinJsonIndex → exact path match → returns ScalarIndex<T>*       │
         │  Range/In/NotIn → ScalarIndex<T> interface   (unchanged)         │
-        │  EXISTS → IndexBase::Exists() → valid_bitset_                    │
+        │  EXISTS → IndexBase::Exists() → non_exist_offsets_               │
         └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -292,8 +292,7 @@ This is a hard reject at index metadata creation time. During rolling upgrade, A
 | `internal/core/src/index/JsonScalarIndexWrapper.h` | **New**: template wrapper for Sort/Bitmap |
 | `internal/core/src/index/JsonHybridScalarIndex.h` | **New**: hybrid wrapper with cardinality-based selection |
 | `internal/core/src/index/JsonIndexBuilder.h/.cpp` | Add `ConvertJsonToTypedFieldData<T>()` |
-| `internal/core/src/index/IndexBase.h` | Add virtual `Exists()` method |
-| `internal/core/src/index/ScalarIndex.h` | Override `Exists()` → return `valid_bitset_` |
+| `internal/core/src/index/Index.h` | Add virtual `Exists()` method returning `const TargetBitmap&` |
 | `internal/core/src/exec/expression/ExistsExpr.cpp` | Simplify to `index->Exists()` |
 | `internal/util/indexparamcheck/stl_sort_checker.go` | Accept JSON, validate json_cast_type/json_path |
 | `internal/util/indexparamcheck/bitmap_index_checker.go` | Accept JSON, validate json_cast_type/json_path |

@@ -35,7 +35,7 @@ The regex engine is [RE2](https://github.com/google/re2) (already a Milvus depen
 | Escape sequences | `\.`, `\*`, `\\` | Yes |
 | Unicode | `\p{Han}`, `\p{Latin}` | Yes |
 | Named groups | `(?P<name>...)` | Yes |
-| Flags | `(?i)` case-insensitive, `(?s)` dot-all | Yes |
+| Flags | `(?i)` case-insensitive, `(?s)` dot-all, `(?-s)` disable dot-all | Yes |
 
 ### NOT Supported (RE2 limitations)
 
@@ -95,7 +95,7 @@ collection.query(
 # Filter log messages containing error codes
 collection.query(
     expr='message =~ "E[0-9]{4}:"',
-    output_fields=["message", "timestamp"]
+    output_fields=["message"]
 )
 
 # JSON field regex — must use path specifier, not root node
@@ -144,6 +144,8 @@ Following SQL standard three-valued logic:
 
 ### 1. Expression Parsing
 
+#### Grammar Changes
+
 The `=~` and `!~` operators are added to the ANTLR grammar (`Plan.g4`) as new tokens and rules:
 
 ```
@@ -156,7 +158,9 @@ expr: ...
     ...
 ```
 
-The Go visitor (`VisitRegexMatch`) validates the field type (VARCHAR / JSON / Array\<VARCHAR\>), validates the regex syntax using Go's `regexp.Compile`, and produces a `UnaryRangeExpr` with `OpType = RegexMatch`:
+The `EscapeSequence` fragment is extended with a catch-all rule `'\\' ~[\r\n]` to accept regex escape sequences (like `\d`, `\w`, `\.`, `\p`) in string literals. Without this, ANTLR would reject patterns containing non-standard escapes at the lexer level.
+
+#### Proto Extension
 
 ```protobuf
 // plan.proto
@@ -166,6 +170,14 @@ enum OpType {
   RegexMatch = 16;  // new
 }
 ```
+
+#### String Extraction
+
+A dedicated `extractRegexPattern()` function handles the regex string literal, bypassing Go's `strconv.Unquote` which does not understand regex escapes like `\d`. The function strips surrounding quotes, converts escaped quotes to literal quotes, and passes all other backslash sequences through unchanged to RE2.
+
+#### Visitor Logic
+
+The Go visitor (`VisitRegexMatch`) validates the field type (VARCHAR / JSON / Array\<VARCHAR\>), validates the regex syntax using Go's `regexp.Compile`, and produces a `UnaryRangeExpr` with `OpType = RegexMatch`.
 
 `VisitRegexNotMatch` reuses `VisitRegexMatch` and wraps the result with a `NOT` expression. No separate `RegexNotMatch` OpType is needed.
 
@@ -178,18 +190,53 @@ The C++ execution layer adds a `PartialRegexMatcher` class that wraps `RE2::Part
 ```cpp
 struct PartialRegexMatcher {
     explicit PartialRegexMatcher(const std::string& pattern);
-    bool operator()(const std::string& value);      // RE2::PartialMatch
-    bool operator()(const std::string_view& value);  // RE2::PartialMatch
+    bool operator()(const std::string& value) const;      // RE2::PartialMatch
+    bool operator()(const std::string_view& value) const;  // RE2::PartialMatch
 };
 ```
 
+RE2 options: `dot_nl=true` (`.` matches `\n`), `log_errors=false`, `encoding=UTF8`.
+
 This contrasts with the existing `RegexMatcher` which uses `RE2::FullMatch` (used internally by `LIKE`'s `Match` op when the LIKE pattern has complex wildcards).
+
+#### Segment-Level Caching
+
+To avoid re-compiling RE2 and re-extracting literals on every batch, `PhyUnaryRangeFilterExpr` caches regex objects at the segment level via `EnsureRegexCache()`:
+
+```cpp
+// Constructed once per segment, reused across all batches:
+std::unique_ptr<PartialRegexMatcher> cached_regex_matcher_;
+std::string cached_volnitsky_literal_;     // longest extractable literal
+std::unique_ptr<VolnitskySearcher> cached_volnitsky_searcher_;
+```
+
+The `EnsureRegexCache()` method is called before the per-batch lambda and the cached pointers are captured by value, ensuring zero-cost reuse across batches.
+
+#### Volnitsky Pre-Filter
+
+For brute-force (no index) execution, a Volnitsky substring searcher pre-filters rows before invoking RE2. The algorithm:
+
+1. Extract literal substrings from the regex pattern (reusing `extract_literals_from_regex`).
+2. Select the longest literal as the Volnitsky needle.
+3. For each row: if `VolnitskySearcher::contains(row)` returns false, skip RE2 entirely.
+4. Only rows passing the Volnitsky pre-filter are verified with `RE2::PartialMatch`.
+
+The `VolnitskySearcher` implements the [Volnitsky algorithm](http://volnitsky.com/project/str_search/):
+- 64KB bigram hash table (fits L2 cache) with open-addressing linear probing.
+- O(n/m) average-case for needles ≥ 4 bytes (bigram skip distance).
+- SSE2 `memchr`-based fallback for short needles (< 4 bytes).
+- Word-aligned fast comparison before full `memcmp`.
+- Tail scanning after main loop to avoid missing matches near the end.
+
+For patterns with a long extractable literal and low match rate, the Volnitsky pre-filter avoids the vast majority of RE2 invocations (e.g., 5-11x CPU speedup observed on benchmarks).
+
+#### Execution Path Integration
 
 The `RegexMatch` op is integrated into the `UnaryExpr` execution pipeline:
 
-- **Raw data path**: For each row, apply `PartialRegexMatcher` to produce a boolean result. The matcher is constructed once per batch (RE2 compilation), then reused across all rows. For JSON shared-data paths, a pre-built `PartialRegexMatcher` is stored in `UnaryCompareContext` to avoid per-row RE2 compilation.
-- **Scalar index path**: Indexes that support `PatternMatch()` (Sort, Marisa, Bitmap, Inverted) iterate unique values and apply matching, which is O(unique\_values) instead of O(total\_rows). For inverted index (tantivy), the regex pattern is converted to tantivy-compatible syntax (`.` → `[\s\S]` for dot\_nl alignment, wrapped with `[\s\S]*(?:...)[\s\S]*` for substring semantics) and executed via `regex_query` on the term dictionary.
-- **Execution ordering**: `RegexMatch` is classified as a "heavy" operation (same as `LIKE`), so it is reordered after cheaper indexed expressions in conjunctive filters.
+- **Raw data path**: For each row, optionally apply Volnitsky pre-filter, then `PartialRegexMatcher`. Both objects are constructed once per segment and reused across all batches. For JSON shared-data paths, a pre-built `PartialRegexMatcher` is stored in `UnaryCompareContext` to avoid per-row RE2 compilation.
+- **Scalar index path**: Indexes that support `PatternMatch()` (Sort, Marisa, Bitmap, Inverted) iterate unique values and apply matching, which is O(unique\_values) instead of O(total\_rows).
+- **Execution ordering**: Both `=~` and `!~` are classified as "heavy" operations (same as `LIKE`), so they are reordered after cheaper indexed expressions in conjunctive filters. For `!~`, `IsLikeExpr` recursively checks through the NOT wrapper.
 
 ### 3. Index Optimization: Ngram Index (Primary Path)
 
@@ -211,7 +258,23 @@ The ngram index is the primary optimization path for regex queries. It uses a tw
 
 This is the same two-phase architecture already used by `LIKE` on ngram indexes.
 
-**Literal extraction strategy**: A conservative parser walks the regex pattern character-by-character, collecting runs of non-metacharacter bytes. Escaped metacharacters (`\.`, `\*`) are treated as literal. Shorthand character classes (`\d`, `\w`) and other metacharacters are treated as split points. This approach is simple, correct, and does not depend on RE2 internals.
+**Literal extraction strategy** (`extract_literals_from_regex`): A conservative parser walks the regex pattern character-by-character, collecting runs of non-metacharacter bytes. Key behaviors:
+
+| Input | Handling |
+|-------|----------|
+| Escaped metacharacters (`\.`, `\*`) | Treated as literal (whitelist: only escaped `.[]+*?^${}()\|\\` are literal) |
+| Shorthand classes (`\d`, `\w`, `\s`, `\b`) | Split point (not literal) |
+| `\p{Han}`, `\P{Script}` | Consumes the `{...}` block, treated as split point |
+| `(?i)` flag | Detected by scanning `[imsU-]` flag chars; causes bail-out (ngram skipped) |
+| Named groups `(?P<name>...)` | Not confused with `(?i)` — only `[imsU-]` are flag chars |
+| Alternation (`\|`) at any level | Bail-out (entire extraction returns empty) |
+| `+` quantifier | Flush current literal and restart (char before `+` may repeat) |
+| `?` quantifier | Remove last char from current literal before flush (char is optional) |
+| `*` quantifier | Remove last char from current literal before flush |
+| `{n}` exact quantifier | Expand: repeat last char n times |
+| `{n,m}` variable quantifier | Expand first n copies, then flush and restart |
+| Non-optional groups `(...)` | Penetrated: literals inside are collected |
+| Optional groups `(...)?`, `(...)*`, `(...){0,...}` | Skipped entirely (content is optional) |
 
 Example extractions:
 
@@ -219,9 +282,13 @@ Example extractions:
 |--------------|-------------------|
 | `"hello"` | `["hello"]` |
 | `"abc.*def"` | `["abc", "def"]` |
-| `"user_[0-9]+@gmail\.com"` | `["user_", "@gmail", "com"]` |
-| `"(?i)error"` | ngram skipped (case-insensitive, brute force) |
+| `"user_[0-9]+@gmail\.com"` | `["user_", "@gmail.com"]` |
+| `"abc(de)fg"` | `["abcdefg"]` |
+| `"colou?r"` | `["colo", "r"]` |
+| `"a{3}"` | `["aaa"]` |
+| `"(?i)error"` | `[]` (ngram skipped — case-insensitive) |
 | `"[a-z]+"` | `[]` (no optimization, brute force) |
+| `"foo\|bar"` | `[]` (alternation bail-out) |
 | `"\d{3}-\d{4}"` | `["-"]` |
 
 ### 4. Case-Insensitive Matching and Ngram
@@ -230,15 +297,15 @@ RE2 supports inline flags such as `(?i)` for case-insensitive matching. The expr
 
 However, ngram indexes store tokens from the original (case-preserved) text. When a case-insensitive pattern is used, extracted literals like `"error"` may not match ngram terms like `"Err"` or `"ERR"` in the index. This causes the ngram coarse filter to produce false negatives — missing rows that should match.
 
-**V1 approach**: When the regex pattern contains a case-insensitive flag (`(?i)`), ngram index optimization is skipped entirely. The query falls back to brute-force `RE2::PartialMatch` on raw data. This is functionally correct but slower.
+**Current behavior**: When the regex pattern contains a case-insensitive flag (`(?i)`), the literal extractor returns empty, causing ngram index optimization to be skipped entirely. The query falls back to brute-force `RE2::PartialMatch` on raw data with Volnitsky pre-filter. This is functionally correct but slower.
 
-**Future optimization (V2)**: Introduce a case-folding option for ngram indexes. When enabled, both the indexed text and query literals are lowercased before ngram tokenization, enabling ngram acceleration for case-insensitive patterns.
+**Future optimization**: Introduce a case-folding option for ngram indexes. When enabled, both the indexed text and query literals are lowercased before ngram tokenization, enabling ngram acceleration for case-insensitive patterns.
 
 ### 5. Regex to LIKE Optimization
 
 Many real-world regex patterns are simple enough to be expressed as equivalent `LIKE` operations, which have dedicated fast paths (e.g., `memcmp` for prefix matching, `string::find` for substring matching) that are significantly faster than invoking the RE2 engine.
 
-The parser detects such patterns and transparently downgrades them to the corresponding `LIKE` OpType:
+The parser detects such patterns via `tryOptimizeRegexToLike()` and transparently downgrades them to the corresponding `LIKE` OpType:
 
 | Regex Pattern | Equivalent | OpType |
 |--------------|------------|--------|
@@ -246,27 +313,36 @@ The parser detects such patterns and transparently downgrades them to the corres
 | `"^abc"` (anchored start + literal) | `LIKE "abc%"` | `PrefixMatch("abc")` |
 | `"abc$"` (literal + anchored end) | `LIKE "%abc"` | `PostfixMatch("abc")` |
 | `"^abc$"` (both anchors + literal) | `== "abc"` | `Equal("abc")` |
+| `"^$"` (both anchors, empty literal) | `== ""` | `Equal("")` |
 
-The conversion is conservative: only patterns composed entirely of literal characters and `^`/`$` anchors are converted. Any regex metacharacter (`.`, `*`, `+`, `?`, `[`, `(`, `{`, `\d`, etc.) causes the pattern to remain as `RegexMatch`.
+The conversion is conservative: only patterns composed entirely of literal characters and `^`/`$` anchors are converted. Escaped metacharacters (e.g., `\.`, `\*`) are treated as literal. Any regex metacharacter (`.`, `*`, `+`, `?`, `[`, `(`, `{`, `\d`, etc.) causes the pattern to remain as `RegexMatch`.
 
 This optimization is applied in the Go parser layer (`VisitRegexMatch`), making it transparent to the execution engine and index layer.
 
 ### 6. Index Support
 
-Regex filtering should work with all index types that support LIKE, using the same or equivalent mechanisms. The goal is: wherever LIKE works, `=~` should also work.
+Regex filtering works with all index types that support LIKE, using the same or equivalent mechanisms. Wherever LIKE works, `=~` also works.
 
-| Index Type | LIKE Support | Regex (`=~`) Strategy |
-|------------|-------------|----------------------|
-| **No index (brute force)** | RE2 FullMatch on raw data | RE2 PartialMatch on raw data |
-| **Ngram index** | Two-phase: ngram filter + LIKE verify | Two-phase: ngram filter (literal extraction) + RE2 PartialMatch verify |
-| **Inverted index (tantivy)** | PatternQuery (LIKE→regex→FST) | Convert `.` → `[\s\S]` for dot\_nl alignment, wrap with `[\s\S]*(?:...)[\s\S]*` for substring semantics, call `regex_query` on term dictionary. Iterates unique values via FST intersection. |
-| **Sort index (StringIndexSort)** | PrefixMatch via range query | Iterate unique values with RE2 PartialMatch, union posting lists of matches. O(unique\_values). |
-| **Marisa index (StringIndexMarisa)** | PatternMatch dispatch | Iterate unique trie keys with RE2 PartialMatch, union row offsets. O(unique\_values). |
-| **Bitmap index** | PatternMatch/PatternQuery | Iterate unique keys with RE2 PartialMatch, union bitmaps. O(unique\_values). |
+| Index Type | Regex (`=~`) Strategy |
+|------------|----------------------|
+| **No index (brute force)** | Volnitsky pre-filter (if extractable literal exists) + RE2 PartialMatch on raw data |
+| **Ngram index** | Two-phase: ngram filter (literal extraction) + RE2 PartialMatch verify |
+| **Inverted index (tantivy)** | Convert pattern to tantivy-compatible syntax (see below), call `regex_query` on term dictionary |
+| **Sort index (StringIndexSort)** | Iterate unique values with RE2 PartialMatch, union posting lists. O(unique\_values). Both Memory and Mmap impls. |
+| **Marisa index (StringIndexMarisa)** | Iterate unique trie keys with RE2 PartialMatch, union row offsets. O(unique\_values). |
+| **Bitmap index** | Iterate unique keys with RE2 PartialMatch, union bitmaps. O(unique\_values). All three build modes (mmap/ROARING/BITSET). |
 
 All index types that support `PatternMatch()` iterate unique values rather than per-row `Reverse_Lookup`, making regex on indexed fields O(unique\_values) instead of O(total\_rows).
 
 For non-ngram indexes, the regex-to-LIKE optimization (Section 5) is important: simple patterns like `"^prefix"` are converted to `PrefixMatch` which can leverage sort index range queries and inverted index prefix queries natively.
+
+#### Inverted Index (tantivy) Pattern Conversion
+
+Since RE2 uses `dot_nl=true` (`.` matches `\n`) but tantivy's regex engine defaults to `.` not matching `\n`, the pattern must be converted via `regex_to_tantivy_pattern()`:
+
+1. **Dot replacement**: Unescaped `.` outside character classes is replaced with `[\s\S]` (matches any character including `\n`). Escaped dots (`\.`) and dots inside `[...]` are unchanged.
+2. **`(?s)`/`(?-s)` flag tracking**: The function maintains a `dot_all` state (initially `true`, matching RE2's `dot_nl=true`). Inline `(?s)` enables dot-all; `(?-s)` disables it. When dot-all is disabled, `.` is left as-is (tantivy's default behavior matches the intended semantics). Scoped flag groups `(?s:...)` and `(?-s:...)` are tracked with a stack to properly restore state on group close.
+3. **Substring wrapping**: The pattern is wrapped with `[\s\S]*(?:...)[\s\S]*` for substring matching semantics.
 
 ### 7. Supported Field Types
 
@@ -296,18 +372,20 @@ Regex supports the same field types and access patterns as LIKE:
 - Patterns with metacharacters remain as RegexMatch (not converted to LIKE).
 
 ### Unit Tests (C++)
-- `PartialRegexMatcher` correctly implements substring matching.
-- `UnaryExpr` with `RegexMatch` produces correct bitmaps on raw data.
-- Ngram index `extract_literals_from_regex` correctly extracts literals from various patterns.
+- `PartialRegexMatcher` correctly implements substring matching: anchors, case-insensitive `(?i)`, dot\_nl, quantifiers, Unicode, named groups, control characters.
+- `UnaryExpr` with `RegexMatch` produces correct bitmaps on raw data (growing segment, 100K rows).
+- `extract_literals_from_regex`: 40+ direct extractor tests covering alternation bail-out, `(?i)` detection, `\p{...}` consumption, quantifier expansion, group penetration, whitelist escapes. Each test also verifies no false negatives (extracted literal must appear in any matching string).
+- `regex_to_tantivy_pattern`: `(?s)`/`(?-s)` flag awareness, scoped groups, escaped dots, character classes, non-capturing groups, combined flags.
+- ClickHouse edge case alignment: empty pattern, `.*`, dot\_nl, `(?-s)`, alternation, Unicode codepoints, emoji, word boundaries, backreference rejection.
 - Ngram two-phase execution (Phase1 + Phase2) produces correct results for `RegexMatch`.
-- Case-insensitive `(?i)` patterns bypass ngram optimization and still produce correct results via brute force.
 - NULL field values produce NULL results (excluded from filter).
-- Edge cases: empty pattern, empty string values, pattern with no extractable literals, Unicode patterns.
 
 ### Integration Tests
 - End-to-end: create collection with VARCHAR field, insert data, query with `=~` and `!~`, verify results.
 - With ngram index: create ngram index on field, verify regex queries use ngram acceleration.
+- All index types: inverted, sort, marisa, bitmap, ngram — verified across 25 test patterns.
 - Case-insensitive: verify `(?i)` patterns return correct results with and without ngram index.
+- JSON field: `metadata["key"] =~ "pattern"`.
 - Combined with vector search: hybrid search with regex filter.
 
 ---
@@ -321,8 +399,8 @@ Regex supports the same field types and access patterns as LIKE:
 | Pattern language | SQL wildcards (`%`, `_`) | RE2 regex |
 | Matching semantics | Full-string | Substring |
 | Pattern decomposition | Yes (PrefixMatch, InnerMatch, etc.) | No (except regex-to-LIKE optimization) |
-| Execution engine | Specialized matchers (memcmp, string::find) | RE2 |
-| Index optimization | Ngram, inverted (PatternQuery), sort (prefix) | Ngram (primary), brute force (fallback) |
+| Execution engine | Specialized matchers (memcmp, string::find) | RE2 (with Volnitsky pre-filter) |
+| Index optimization | Ngram, inverted (PatternQuery), sort (prefix) | Ngram (primary), all index types (unique-value iteration) |
 
 For simple patterns, `LIKE` is faster because it avoids the regex engine entirely. Users should prefer `LIKE` when the pattern can be expressed with `%` and `_` wildcards. `=~` is for patterns that require regex expressiveness.
 
@@ -348,42 +426,25 @@ Tantivy's `RegexQuery` uses FST+Automaton intersection for regex matching on the
 
 ### P0 — Must Have
 
-- [x] **Brute-force regex (no index)**: Raw data scan path verified via C++ UT on growing segments. RE2 PartialMatch on every row works correctly.
-- [x] **Sealed segment verification**: Analysis confirmed sealed and growing segments share the same UnaryExpr execution path. Growing segment UT provides coverage.
-- [x] **All index types support regex**: All index types that support LIKE now support `=~`:
-  - Inverted index (tantivy): PatternMatch converts `.` → `[\s\S]`, wraps for substring semantics, calls `regex_query` on term dictionary
-  - Sort index (StringIndexSort): unique-value iteration with PartialRegexMatcher (both Memory and Mmap impl)
-  - Marisa index (StringIndexMarisa): unique-value iteration with PartialRegexMatcher
-  - Bitmap index: unique-value iteration with PartialRegexMatcher (all three build modes)
-  - Ngram index: two-phase literal extraction (with group penetration, quantifier expansion) + RE2 PartialMatch verification
+- [x] **Brute-force regex (no index)**: Raw data scan with Volnitsky pre-filter + RE2 PartialMatch, cached at segment level.
+- [x] **All index types support regex**: Inverted (tantivy), Sort, Marisa, Bitmap, Ngram — all support `=~` via unique-value iteration or two-phase execution.
+- [x] **Tantivy `(?s)`/`(?-s)` alignment**: `regex_to_tantivy_pattern()` tracks inline dot-all flags, ensuring consistent semantics across all execution paths.
 - [ ] **E2E integration tests**: Python pymilvus end-to-end tests:
   - Create collection → insert → query with `=~` and `!~` → verify results
   - Test with no index, inverted index, ngram index configurations
   - Hybrid search: vector search combined with regex filter
   - JSON field: `metadata["key"] =~ "pattern"`
   - Array\<VARCHAR\> field: element-level regex matching
-- [x] **Retrieve path**: Analysis confirmed query and search use the same expression executor. No separate handling needed.
 
 ### P1 — Important
 
-- [x] **Proxy layer validation**: All OpType enumeration points in proxy/delegator code reviewed. Default/fallback behaviors are correct for RegexMatch (scalar pruning returns allTrue, PK filter returns unsupported, reverseOrder not applicable). No changes needed.
 - [ ] **Template expression support**: Verify `field =~ {pattern}` works with parameterized queries
-- [x] **SDK check**: Confirmed Python (pymilvus) and Go client pass expression strings through without client-side parsing or validation. No SDK changes needed.
-
-### P2 — Before GA
-
 - [ ] **User documentation**: Expression syntax reference — document `=~` and `!~` operators, supported regex syntax (RE2), matching semantics (substring), and known limitations
-- [ ] **Known limitations documentation**:
-  - `(?i)` case-insensitive skips ngram optimization (brute force fallback)
-  - RE2 does not support backreferences, lookahead/lookbehind
-  - Complex patterns on large datasets without ngram index will be slow
 
-### P3 — Future Optimizations
+### P2 — Future Optimizations
 
-- [ ] **Alternation OR splitting for ngram**: Currently `abc|xyz` bails out of ngram entirely. Optimization: split on top-level `|`, extract literals from each branch independently, query ngrams per branch, OR the candidate bitmaps. Requires changing `ExecutePhase1` from a single `vector<string>` (AND) to `vector<vector<string>>` (OR of ANDs). Ref: ClickHouse `analyzeImpl()` extracts `alternatives` and tests them individually.
-- [ ] **Brute-force pre-filter (Volnitsky-style)**: When no ngram index exists, extract a required literal from the regex and use `string::find` to pre-filter rows before running RE2. ClickHouse uses the Volnitsky algorithm (bigram hash table, 64KB L2-cache-friendly, 10-100x faster than `strstr`) for this. Milvus can start with `string::find` and optionally adopt Volnitsky later for further speedup. This avoids running the RE2 engine on rows that obviously don't contain the required literal.
-- [ ] **Hyperscan multi-pattern optimization**: When multiple regex filters target the same field (e.g., `field =~ "pattern_a" || field =~ "pattern_b"` or `field =~ "pattern_a" && field =~ "pattern_b"`), compile all patterns into a single Hyperscan DFA and scan each row once. O(n) regardless of pattern count, vs O(n×k) for k independent RE2 evaluations. Requires an expression optimization pass to detect multi-regex conjunctions/disjunctions on the same field and batch them. Ref: ClickHouse uses Hyperscan for `multiMatchAny()`.
-- [x] ~~**Group penetration for literal extraction**~~: Implemented. `abc(de)fg` now extracts `"abcdefg"`. Non-optional groups are penetrated; optional groups (`?`, `*`, `{0,...}`) are skipped.
+- [ ] **Alternation OR splitting for ngram**: Currently `abc|xyz` bails out of ngram entirely. Optimization: split on top-level `|`, extract literals from each branch independently, query ngrams per branch, OR the candidate bitmaps. Requires changing `ExecutePhase1` from a single `vector<string>` (AND) to `vector<vector<string>>` (OR of ANDs).
+- [ ] **Hyperscan multi-pattern optimization**: When multiple regex filters target the same field (e.g., `field =~ "pattern_a" || field =~ "pattern_b"`), compile all patterns into a single Hyperscan DFA and scan each row once. O(n) regardless of pattern count, vs O(n×k) for k independent RE2 evaluations.
 
 ---
 
@@ -402,6 +463,7 @@ Tantivy's `RegexQuery` uses FST+Automaton intersection for regex matching on the
 | **Unicode `\p{}`** | Yes | Yes | Yes | No |
 | **`\d` `\w` `\s`** | Yes | Yes | Yes | No |
 | **Index Acceleration** | Ngram (two-phase) | pg_trgm GIN/GiST | ngrambf bloom skip index | Automaton × term dictionary |
+| **Pre-filter** | Volnitsky (bigram hash, SSE2) | None | Volnitsky (SSE2 StringSearcher) | None |
 | **Performance Guardrail** | RE2 linear time | None (use `statement_timeout`) | RE2 linear time | `max_determinized_states` |
 
 **Design rationale:** Milvus's regex support is most similar to ClickHouse — both use RE2 with substring matching semantics. RE2 is the preferred choice for database systems because it guarantees linear-time execution (no catastrophic backtracking / ReDoS), at the cost of not supporting backreferences and lookahead/lookbehind. PostgreSQL's Spencer engine supports these features but has no built-in protection against pathological patterns. Elasticsearch's Lucene regex is the most limited (no `\d`/`\w`/`\s`, no named groups) and uses full-string matching semantics.
@@ -410,7 +472,7 @@ The ngram index acceleration approach is analogous to PostgreSQL's `pg_trgm` ext
 
 ### Detailed Alignment with ClickHouse
 
-Milvus's regex implementation is designed to align with ClickHouse's `match()` function semantics, since both use RE2 as the underlying engine. The following details are verified against ClickHouse source code (`src/Common/OptimizedRegularExpression.cpp`, `src/Functions/MatchImpl.h`).
+Milvus's regex implementation is designed to align with ClickHouse's `match()` function semantics, since both use RE2 as the underlying engine.
 
 #### RE2 Options
 
@@ -429,7 +491,7 @@ Milvus's regex implementation is designed to align with ClickHouse's `match()` f
 | Anchoring | UNANCHORED (`RE2::Match` with `UNANCHORED`) | `RE2::PartialMatch` | Yes (equivalent) |
 | `match('Hello', '')` | Returns 1 (empty pattern matches everything) | `PartialMatch` returns true | Yes |
 | `match('x', '.*')` / `match('x', '.*?')` | Fast path: returns 1 without running RE2 | Runs RE2 (correct but no fast path) | Functionally equivalent |
-| `(?-s)` flag | Disables dot_nl (`.` stops matching `\n`) | Disables dot_nl | Yes |
+| `(?-s)` flag | Disables dot_nl (`.` stops matching `\n`) | Disables dot_nl (in both RE2 and tantivy paths) | Yes |
 
 #### Regex-to-Literal Optimization
 
@@ -440,9 +502,8 @@ Both ClickHouse and Milvus optimize simple regex patterns to avoid the RE2 engin
 | **Trivial literal detection** | If pattern has no metacharacters → `is_trivial=true`, uses `strstr()` | `tryOptimizeRegexToLike`: pure literal → `InnerMatch` (uses `string::find`) |
 | **Prefix detection** | Detects if required substring is at the start of the regex | `^literal` → `PrefixMatch` |
 | **Alternation handling** | Extracts list of alternative substrings for multi-pattern matching | Returns empty (bails out on `\|`) — more conservative |
-| **Required substring extraction** | Extracts longest required literal for pre-filtering with Volnitsky search | Extracts all required literals for ngram AND-filtering |
-
-ClickHouse's `OptimizedRegularExpression` is more sophisticated in handling alternation — it can extract alternative substrings and test them individually. Milvus's `extract_literals_from_regex` takes a more conservative approach: any pattern containing alternation (`|`) at any nesting level skips ngram optimization entirely, falling back to brute-force RE2. This is safe (no false negatives) but may be less efficient for alternation-heavy patterns.
+| **Required substring extraction** | Extracts longest required literal for Volnitsky pre-filter | Extracts all required literals for ngram AND-filtering + longest for Volnitsky pre-filter |
+| **Pre-filter algorithm** | Volnitsky on contiguous ColumnString buffer (single scan across all rows) | Volnitsky per-row on individual string\_view |
 
 #### Differences and Rationale
 
@@ -450,9 +511,9 @@ ClickHouse's `OptimizedRegularExpression` is more sophisticated in handling alte
 |-----------|-----------|--------|-----------|
 | **UTF-8 fallback** | Falls back to Latin-1 if UTF-8 parsing fails | UTF-8 only, fails on invalid UTF-8 | Milvus VARCHAR fields are expected to be valid UTF-8. Binary data is not a target use case. |
 | **Fast path for `.*`** | Special-cased to return all-true without running RE2 | Runs RE2 (returns true for all inputs) | Correctness equivalent. Could be added as a performance optimization later. |
-| **Alternation optimization** | Extracts alternative substrings, tests each with Volnitsky | Bails out, falls back to brute-force RE2 | Conservative approach avoids false negatives. ClickHouse's approach is more complex but more efficient for `abc\|xyz`-style patterns. |
-| **String searcher** | Volnitsky algorithm (SIMD-optimized) for substring pre-filter | `string::find` (via InnerMatch) or ngram index | Different optimization strategies suited to different architectures. |
-| **Capturing groups** | Supports `extract()`, `extractAll()`, `extractGroups()` with up to 1024 groups | Not supported (filter-only, no extraction) | Milvus is a vector database; regex is used for filtering, not data extraction. |
+| **Alternation optimization** | Extracts alternative substrings, tests each with Volnitsky | Bails out, falls back to brute-force RE2 | Conservative approach avoids false negatives. Could be optimized in P2. |
+| **Volnitsky scan scope** | Single scan over contiguous ColumnString buffer (cross-row bigram jumps) | Per-row scan on individual `string_view` | Milvus sealed segments have contiguous `StringChunk` layout — future optimization could do cross-row scanning similar to ClickHouse. |
+| **Capturing groups** | Supports `extract()`, `extractAll()`, `extractGroups()` | Not supported (filter-only, no extraction) | Milvus is a vector database; regex is used for filtering, not data extraction. |
 
 #### Verified Edge Case Alignment
 
@@ -482,3 +543,4 @@ The following edge cases were tested against ClickHouse's documented behavior an
 - [RE2 Safety Guarantees](https://swtch.com/~rsc/regexp/regexp1.html) — linear-time matching, no catastrophic backtracking
 - [Google Code Search](https://swtch.com/~rsc/regexp/regexp4.html) — trigram index for regex acceleration (same approach as our ngram optimization)
 - [PostgreSQL Pattern Matching](https://www.postgresql.org/docs/current/functions-matching.html) — `~` operator with substring semantics
+- [Volnitsky Algorithm](http://volnitsky.com/project/str_search/) — O(n/m) substring search with bigram hash table

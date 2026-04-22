@@ -65,43 +65,29 @@ surface is:
 
 | Key | Default | Refresh | Description |
 |-----|---------|---------|-------------|
-| `dataNode.storage.text.inlineThreshold` | `65536` B | dynamic | TEXT values strictly smaller than this are encoded inline in the reference binlog; larger values go to a LOB Vortex file. |
-| `dataNode.storage.text.maxLobFileSize` | `268435456` B (256 MiB) | dynamic | Maximum size of a single LOB Vortex file. |
-| `dataNode.compaction.text.holeRatioThreshold` | `0.3` | dynamic | If overall hole ratio across source segments < threshold, compaction runs in REUSE_ALL mode; otherwise REWRITE_ALL. |
+| `dataNode.text.inlineThreshold` | `65536` B | dynamic | TEXT values strictly smaller than this are encoded inline in the reference binlog; larger values go to a LOB Vortex file. |
+| `dataNode.text.maxLobFileBytes` | `67108864` B (64 MiB) | dynamic | Maximum size of a single LOB Vortex file. |
+| `dataNode.text.flushThresholdBytes` | `16777216` B (16 MiB) | dynamic | Spillover flush trigger for the growing segment LOB writer. |
+| `dataNode.compaction.lobHoleRatioThreshold` | `0.3` | dynamic | If overall hole ratio across source segments < threshold, compaction runs in REUSE_ALL mode; otherwise REWRITE_ALL. |
 | `dataCoord.gc.lob.enabled` | `true` | static | Enable the dedicated LOB GC. |
 | `dataCoord.gc.lob.safetyWindow` | `3600` s | dynamic | Minimum file age before LOB GC may delete an orphan. |
 | `dataCoord.gc.lob.checkInterval` | `1800` s | dynamic | LOB GC scan interval. |
 
-### New proto field
-
-`SegmentInfo` gains a per-field map of LOB file references so that GC and
-compaction can compute hole ratios from metadata alone, without scanning
-binlogs:
-
-```proto
-message SegmentInfo {
-  // ... existing fields ...
-  map<int64, LOBFileRefs> lob_file_refs = N;   // key: field_id
-}
-
-message LOBFileRefs { repeated LOBFileRefInfo files = 1; }
-
-message LOBFileRefInfo {
-  int64 file_id   = 1;   // partition-unique LOB file id
-  int64 row_count = 2;   // total rows in the Vortex file
-  int64 ref_count = 3;   // rows in this segment that reference the file
-}
-```
-
 ### New milvus-storage FFI surface
 
-A single high-level surface `text_column_writer_*` / `text_column_reader_*`
-plus low-level `vortex_writer_*` / `vortex_reader_*` (the latter reused by
-compaction). The Go side passes a `CTextColumnConfig { segment_base_path,
-lob_base_path, size_threshold, max_lob_file_size }` and a single Arrow
-`RecordBatch` per write call. Inside the FFI, the writer classifies each row,
-emits LOB bytes to a Vortex file, encodes references into the reference
-binlog, and commits a column-group transaction.
+Two FFI surfaces are used. For **compaction and import**, the Go side
+configures TEXT columns via `TextColumnConfig { FieldID, LobBasePath,
+InlineThreshold, MaxLobFileBytes, FlushThresholdBytes, RewriteMode }` and
+passes them to the `loon_segment_writer_*` FFI (`loon_segment_writer_new`,
+`loon_segment_writer_write`, `loon_segment_writer_close`). For **growing-
+segment flush**, the Go side calls `FlushGrowingSegmentData` in segcore,
+which extracts unflushed rows and writes them through the milvus-storage
+writer entirely in C++ — no per-row data crosses the CGO boundary. Inside
+the C++ writer, each row is classified by `InlineThreshold`, LOB-sized
+values are appended to Vortex files via `VortexFileWriter`, and references
+are encoded into the reference binlog. The C struct exposed to segcore is
+`CFlushConfig`; the C struct exposed to the segment-writer FFI is
+`LoonLobColumnConfig`.
 
 ### Reused interfaces (no change)
 
@@ -120,9 +106,8 @@ binlog, and commits a column-group transaction.
  │ Control plane                                                        │
  │  ┌─────────────────────────┐    ┌────────────────────────────────┐   │
  │  │ DataCoord               │    │ DataCoord LOB GC               │   │
- │  │  - SegmentInfo          │◀──▶│  - scans lob_file_refs         │   │
- │  │  - lob_file_refs (etcd) │    │  - safety window               │   │
- │  │  - SaveBinlogPaths      │    │                                │   │
+ │  │  - SegmentInfo          │◀──▶│  - scans reference binlogs     │   │
+ │  │  - SaveBinlogPaths      │    │  - safety window               │   │
  │  └─────────────────────────┘    └────────────────────────────────┘   │
  └──────────────────────────────────────────────────────────────────────┘
  ┌──────────────────────────────────────────────────────────────────────┐
@@ -135,24 +120,24 @@ binlog, and commits a column-group transaction.
  │  │  GrowingFlushManager (Go, new)                               │    │
  │  │   reuses flushcommon SyncPolicy / SyncManager / MetaWriter   │    │
  │  │   uses CheckpointTracker (Go, new)                           │    │
- │  │   calls segcore ExtractBatch + text_column_writer_* (FFI)    │    │
+ │  │   calls segcore FlushGrowingSegmentData (C FFI)              │    │
  │  └──────────────────────────────────────────────────────────────┘    │
  │                                                                      │
  │  ┌──────────────────────────┐  ┌────────────────────────────────┐    │
  │  │ DataNode compactor       │  │ DataNode importer              │    │
  │  │  text-aware:             │  │  csv / json / parquet          │    │
  │  │   REUSE_ALL  (file copy) │  │  routes large TEXT through     │    │
- │  │   REWRITE_ALL            │  │  text_column_writer_* FFI      │    │
+ │  │   REWRITE_ALL            │  │  loon_segment_writer_* FFI     │    │
+ │  │   SKIP (L0 deletes)      │  │                                │    │
  │  └──────────────────────────┘  └────────────────────────────────┘    │
  │            │                                  │                      │
  │            ▼                                  ▼                      │
  │  ┌──────────────────────────────────────────────────────────────┐    │
  │  │ C++ milvus-storage                                           │    │
- │  │  TextColumnManager (Writer / Reader)                         │    │
  │  │  Transaction<ColumnGroups>     (segment-level reference)     │    │
  │  │  PackedWriter / Reader         (Parquet, reference binlog)   │    │
- │  │  VortexFileWriter / Reader     (LOB payloads)                │    │
- │  │  ETagAllocator                 (partition-level file_id CAS) │    │
+ │  │  VortexFileWriter              (LOB payloads)                │    │
+ │  │  UUID file naming              (partition-level LOB files)    │    │
  │  └──────────────────────────────────────────────────────────────┘    │
  └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -176,7 +161,6 @@ per-partition.
 │
 └── lobs/                               # PARTITION level (shared!)
     └── {field_id}/
-        ├── _next_id                    # 8-byte int64, ETag CAS allocator
         └── _data/
             ├── {file_id_1}.vx          # Vortex file, append-only
             ├── {file_id_2}.vx
@@ -189,9 +173,9 @@ Key consequences of this layout:
   reference the same `{file_id}.vx`. Compaction reuse is therefore a pure
   metadata operation — the LOB bytes never move.
 - **LOB files do not have their own manifest.** A `file_id` *is* the path:
-  `{partition}/lobs/{field}/_data/{file_id}.vx`. Allocation is done by C++
-  via ETag conditional write on `_next_id`, so multiple writers can share
-  the same partition without coordination through Go or etcd.
+  `{partition}/lobs/{field}/_data/{file_id}.vx`. Each writer generates a
+  UUID for the `file_id`, so multiple writers can share the same partition
+  without coordination through Go or etcd.
 - **Reference binlog reuses the existing column-group manifest.** From the
   manifest's point of view, the TEXT field is just another column group of
   Parquet files; the only special thing is the row encoding inside.
@@ -206,44 +190,45 @@ Key consequences of this layout:
 Every row of a TEXT column carries a 1-byte flag prefix:
 
 ```
-0x00  inline:    [0x00] [text bytes ...]
-0x01  LOB ref:   [0x01] [pad x3] [file_id : int64] [row_offset : int32]
-                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                 16 bytes total, 8-byte aligned
+0x00  inline:    [0x00] [text bytes ...]                     (variable length)
+0x01  LOB ref:   [0x01] [pad x3] [file_id : uuid] [row_offset : int32]
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                 24 bytes total, 4-byte aligned
+
+Byte layout of a LOB reference:
+  Offset  Size  Field
+  0       1     flag         = 0x01
+  1-3     3     padding      (reserved, 0x00)
+  4-19    16    file_id      binary UUID of the LOB Vortex file
+  20-23   4     row_offset   int32, row index in the Vortex file
 ```
+
+The `file_id` is a 16-byte binary UUID; the standard string form
+(`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) is used when building the
+object-store path `{partition}/lobs/{field}/_data/{file_id}.vx`.
 
 The `row_offset` is a **row index** inside the Vortex file, not a byte
 offset. Vortex's split index resolves it in O(log N) where N is the number
 of splits. Using row indices keeps the reference valid after Vortex
 re-encodes / recompresses splits.
 
-#### SegmentInfo extension
-
-Each segment carries `lob_file_refs[field_id] = [{file_id, row_count,
-ref_count}, ...]` so DataCoord can compute hole ratios and run GC purely from
-metadata.
-
 #### Invariants
 
 1. A LOB Vortex file is **immutable** once closed.
-2. A LOB file is reachable iff at least one live `SegmentInfo.lob_file_refs`
-   entry names its `file_id`.
+2. A LOB file is reachable iff at least one live segment's reference binlog
+   contains a LOB reference naming its `file_id`.
 3. References never cross partition boundaries.
 
 ### Components
 
 | Component | Layer | Responsibility |
 |-----------|-------|----------------|
-| `TextColumnManager` | C++ milvus-storage | Factory for `TextColumnWriter` / `TextColumnReader`. |
-| `TextColumnWriter` | C++ milvus-storage | Classifies each row inline vs LOB; drives the Vortex writer and the parquet reference writer; runs the two-phase commit. |
-| `TextColumnReader` | C++ milvus-storage | Reads the reference binlog; resolves LOB references through a per-`file_id` Vortex reader cache. |
-| `VortexFileWriter` / `VortexFileReader` | C++ milvus-storage | Native Vortex IO. Reader exposes `take(row_indices)` and `read_with_range`. |
-| `ETagAllocator` | C++ milvus-storage (internal) | CAS allocator for partition-scoped LOB `file_id`s via cloud-storage `If-Match`. Not exposed over FFI. |
-| `text_column_writer_*` / `text_column_reader_*` | FFI | Single high-level surface used by Go. |
+| `VortexFileWriter` | C++ milvus-storage | Native Vortex IO for LOB payloads. |
+| `loon_segment_writer_*` | FFI (C → Go) | Segment-writer FFI surface used by compaction and import. Accepts `LoonLobColumnConfig` for TEXT columns. |
+| `FlushGrowingSegmentData` | C FFI (segcore) | Extracts unflushed rows from a growing segment and writes them through the milvus-storage writer entirely in C++. Accepts `CFlushConfig`. |
 | `GrowingFlushManager` | Go (`querynodev2/segments`) | Per-channel scheduler that drives growing-segment flush for TEXT collections. |
 | `GrowingSegmentBuffer` | Go (`querynodev2/segments`) | Adapter that exposes a growing segment to the existing `SyncPolicy` interface (`IsFull`, `MinTimestamp`, `MemorySize`). |
 | `CheckpointTracker` | Go (`querynodev2/segments`) | Maps `(segmentID, row offset)` → `MsgPosition`, derived from the `StartPosition` already carried by `delegator.InsertData`. Drives checkpoint reporting. |
-| `SegmentGrowingImpl::ExtractBatch` | C++ segcore (new) | Returns an Arrow `RecordBatch` for `[start_offset, end_offset)` so the writer can stream growing-segment data into milvus-storage without copying through Go. |
 
 ### Why TEXT collections flush from the growing segment
 
@@ -280,31 +265,34 @@ description below follows from it.
    existing flushcommon `SyncPolicy`s (`FullBuffer`, `StaleBuffer`,
    `Sealed`, `FlushTs`). Selected segments are dispatched to a sync
    worker.
-4. **Extract.** `Segment.ExtractBatch(flushedOffset, currentOffset)` calls
-   into segcore, which returns an Arrow `RecordBatch` for the unflushed
-   row range. No copies cross Go.
-5. **C++ write (FFI).** Go calls `text_column_writer_write(handle, batch)`.
-   Inside C++:
-   - Each row is classified by `inlineThreshold`.
+4. **C++ flush (single FFI call).** Go calls
+   `segment.FlushData(ctx, flushedOffset, currentOffset, flushConfig)`,
+   which invokes `FlushGrowingSegmentData` in segcore. The entire
+   extract → classify → write → commit sequence runs in C++:
+   - Segcore extracts unflushed rows from the growing segment's
+     `ConcurrentVector` for `[flushedOffset, currentOffset)`.
+   - Each TEXT row is classified by `InlineThreshold`.
    - LOB-sized values are appended to the current Vortex file via
      `VortexFileWriter`. The first time a LOB write happens in the writer
-     instance, `ETagAllocator::Allocate()` reserves a new `file_id` from
-     `_next_id` using cloud-storage `If-Match`.
+     instance, a new UUID is generated as the `file_id` for the Vortex
+     file.
    - The reference binlog is written via the existing `PackedWriter`,
      with each row encoded as either `[0x00 | bytes]` or
      `[0x01 | pad | file_id | row_offset]`.
-6. **Two-phase commit.** `text_column_writer_commit` runs in order:
-   close Vortex → close reference parquet → commit the column-group
-   `Transaction` → return the list of LOB `file_id`s + manifest version.
-7. **Metadata update.** Go updates the segment manifest via the existing
+   - On completion, Vortex files are closed, the reference parquet is
+     closed, the column-group `Transaction` is committed, and the
+     manifest path + LOB `file_id`s are returned to Go.
+   No per-row data crosses the CGO boundary.
+5. **Metadata update.** Go updates the segment manifest via the existing
    `MetaWriter` (`SaveBinlogPaths` with `Flushed=false`,
-   `WithFullBinlogs=false`) and writes the new
-   `SegmentInfo.lob_file_refs` entries to etcd. Checkpoint propagation
-   reuses `ChannelCheckpointUpdater`.
+   `WithFullBinlogs=false`). Checkpoint propagation reuses
+   `ChannelCheckpointUpdater`. After `SaveBinlogPaths` succeeds, the
+   `CheckpointTracker` updates the flushed offset and acknowledged
+   manifest version.
 
-Failure semantics: a crash before step 6 leaves an orphan Vortex file
-under `lobs/{field}/_data/`, never referenced from any `SegmentInfo`. The
-LOB GC sweeps it after the safety window.
+Failure semantics: a crash before step 4 completes leaves an orphan
+Vortex file under `lobs/{field}/_data/`, never referenced from any
+`SegmentInfo`. The LOB GC sweeps it after the safety window.
 
 ### Read path
 
@@ -325,45 +313,48 @@ The query and expression layers above `GetText` are unchanged.
 
 ### Compaction
 
-Compaction decides upfront, from `lob_file_refs` of the source segments
-(no binlog scan needed):
+Compaction decides upfront by scanning the reference binlogs of the source
+segments to collect per-`file_id` reference counts:
 
 ```
 total_refs = Σ ref_count over all (segment, file)
-total_rows = Σ row_count over all distinct file_ids
+total_rows = Σ row_count over all distinct file_ids   (from Vortex file metadata)
 hole_ratio = 1 - total_refs / total_rows
 ```
 
 - **REUSE_ALL** (`hole_ratio < threshold`, default 0.3): the TEXT column
   in the output is built by **byte-copying** the encoded reference rows
   from each source binlog. `file_id` and `row_offset` are unchanged. LOB
-  Vortex files are not touched. The output `SegmentInfo.lob_file_refs`
-  is the per-`file_id` merge of source `ref_count`s. This is the common
+  Vortex files are not touched. This is the common
   case and is essentially free.
 - **REWRITE_ALL** (`hole_ratio ≥ threshold`): for each live row, the
   compactor reads the original text (inline or via LOB) and feeds it
-  through `text_column_writer_*` again. The output gets brand-new LOB
-  files with dense `row_offset`s starting from 0. Old LOB files lose
-  references and are reclaimed by GC.
+  through `loon_segment_writer_*` again. The output gets brand-new LOB
+  files with dense `row_offset`s starting from 0. Old LOB files that
+  lose all references are reclaimed by GC.
 
 Some compaction kinds bypass the hole-ratio decision and force a fixed
 strategy because their data movement is predetermined:
 
-- **Clustering compaction**: always REWRITE_ALL — data is repartitioned
-  across the output segments, so LOB references cannot be reused as-is.
+- **Clustering compaction** (including `ClusteringPartitionKeySortCompaction`):
+  always REWRITE_ALL — data is repartitioned across the output segments,
+  so LOB references cannot be reused as-is.
 - **Mix compaction with split (1 → N)**: always REWRITE_ALL — rows are
   redistributed across multiple output segments.
-- **Sort compaction**: always REUSE_ALL — only row order changes, the
-  underlying byte content of each row is unchanged, so reference rows
-  can be byte-copied into the output.
-- **Plain mix compaction (N → 1)**: uses the hole-ratio decision above.
+- **Sort compaction** (including `PartitionKeySortCompaction`): always
+  REUSE_ALL — only row order changes, the underlying byte content of
+  each row is unchanged, so reference rows can be byte-copied into the
+  output.
+- **L0 delete compaction**: always SKIP — only applies delete logs to
+  segments; LOB references in the source segments are unchanged.
+- **Non-split mix compaction**: uses the hole-ratio decision above.
 
 ### Garbage collection
 
 A new `garbage_collector_lob.go` runs alongside the existing segment GC:
 
-- **Reachable set.** Iterate live (non-dropped) `SegmentInfo`s, union all
-  `file_id`s in `lob_file_refs`.
+- **Reachable set.** Scan the reference binlogs of all live (non-dropped)
+  segments, union all `file_id`s found in LOB references.
 - **Scan.** For each `lobs/{field_id}/_data/`, list files. Any file
   whose `file_id` is not in the reachable set **and** whose mtime is
   older than `dataCoord.gc.lob.safetyWindow` is deleted.
@@ -443,8 +434,8 @@ System / integration:
 
 Lower-level coverage:
 
-- C++ unit: `TextColumnWriter`, `TextColumnReader`,
-  `VortexFileWriter/Reader`, `ETagAllocator`, `SegmentGrowingImpl::ExtractBatch`.
+- C++ unit: `VortexFileWriter`, `FlushGrowingSegmentData`,
+  LOB reference encoding / decoding.
 - Go unit: `growing_flush_manager`, `growing_segment_buffer`,
   `checkpoint_tracker`, `garbage_collector_lob`, compaction REUSE/REWRITE
   decision matrix.
@@ -477,11 +468,10 @@ The implementation is considered correct when:
   access is not as cheap as Vortex's split index. The previous
   prototype also kept the writer in Go, so per-row CGO calls dominated.
 
-- **Manage `file_id` allocation in Go via etcd.** Kept as a fallback
-  for object stores without `If-Match`, but rejected as the primary
-  mechanism: it forces every C++ writer to round-trip through Go for
-  each new file and prevents segcore-side autonomy. ETag CAS keeps
-  allocation entirely in C++.
+- **Manage `file_id` allocation in Go via etcd.** Rejected: forces
+  every C++ writer to round-trip through Go for each new file and
+  prevents segcore-side autonomy. UUID generation keeps allocation
+  entirely in C++ with no coordination overhead.
 
 - **Use a separate manifest file for LOB files.** Rejected:
   `file_id → path` is computable; an extra manifest adds another

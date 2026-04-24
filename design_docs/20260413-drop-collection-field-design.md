@@ -225,12 +225,21 @@ func (t *alterCollectionSchemaTask) preExecuteDrop(ctx context.Context) error {
 | Last vector field in schema | `cannot drop the last vector field: {name}` |
 | Field is function input | `field is referenced by function {fn} as input` |
 | Field is function output | `field is referenced by function {fn} as output, drop the function instead` |
+| Target is a sub-field of a struct array field | `cannot drop sub-field of struct array field: {struct}.{sub}` |
+| Dropping whole struct array field would leave no vector | `cannot drop struct array field {name}: it would leave no vector field in the collection` |
+
+**Struct array field scope**:
+- Dropping a **whole struct array field by name or ID** is supported; it is equivalent to batch-dropping the struct entry plus all its sub-fields (`droppedFieldIds` covers the struct ID and every sub-field ID). The existing index cascade and segcore `has_field()` filtering cover the removal without any C++ changes.
+- Dropping an **individual sub-field** is not supported in this change. Milvus has no runtime API for adding a struct array field or an individual sub-field to an existing collection — struct array fields and their sub-fields are declared once at collection creation (neither `add_collection_field` nor `AlterCollectionSchema.AddRequest` accepts a struct-shaped payload). Dropping a single sub-field would therefore be asymmetric with no restore path, and is explicitly rejected.
 
 #### validateDropFunction Constraints
 
 | Constraint | Error Message |
 |-----------|---------------|
+| Function name is empty | `function name is empty` |
 | Function not found | `function not found: {name}` |
+| Cascade removal of output fields would leave no vector in schema | `cannot drop function {name}: it would leave no vector field in the collection` |
+
 
 ### 4.2 RootCoord Layer
 
@@ -442,6 +451,8 @@ func broadcastDisableDynamicField(ctx context.Context, coll *model.Collection) e
 }
 ```
 
+**Proxy-side gate coverage**: Enabling/disabling the dynamic field mutates the schema and bumps `SchemaVersion + 1`, so it must respect the same concurrency invariants as `AlterCollectionSchema` (see §6.1). The `AlterCollection` handler inspects `request.Properties` and, when `dynamicfield.enabled` is present, routes the request through the same `alterSchemaInFlight` + `checkSchemaVersionConsistency` gates as `AlterCollectionSchema`, sharing the same `sync.Map` so the two handlers are mutually exclusive per collection. Requests that only alter unrelated properties (e.g. `collection.ttl.seconds`, `mmap.enabled`) bypass the gate and keep their existing lightweight path.
+
 ### 4.6 Segcore (C++) Layer
 
 **Files**: `internal/core/src/segcore/SegmentLoadInfo.cpp`, `ChunkedSegmentSealedImpl.cpp`, `SegmentGrowingImpl.cpp`
@@ -530,11 +541,63 @@ Drop operations inherit the same concurrency model as add operations through the
 
 3. **Schema Version Consistency Gate**: The proxy checks DataCoord's segment statistics before allowing any schema change. If a previous change (e.g., add-field backfill) hasn't propagated to all segments, the new request is rejected.
 
+**Coverage across RPC entry points**: Because the proxy rootcoord lock serializes concurrent *writes* but not *writer-vs-in-flight-backfill*, layers (1) and (3) must guard every RPC entry that mutates the schema. In this PR, both `AlterCollectionSchema` and the dynamic-field branch of `AlterCollection` go through the same two gates and share the same `alterSchemaInFlight` `sync.Map`, so any two schema mutations targeting the same collection — regardless of which RPC they arrived on — are mutually exclusive, and neither can begin until the previous mutation's backfill has reached 100% of segments.
+
 ### 6.2 Ack Callback Idempotency
 
 The ack callback (`cascadeDropFieldIndexesInline` + `meta.AlterCollection`) may be retried with exponential backoff if it fails. Both operations are idempotent:
 - `meta.AlterCollection`: Overwrites metadata; repeated calls produce the same result
 - `MarkIndexAsDeleted`: Skips already-deleted indexes
+
+### 6.3 Cascade Intermediate Window
+
+A drop proceeds in two phases within the ack-callback pipeline:
+
+1. **Metadata phase**: `meta.AlterCollection` removes the field from `coll.Fields`. After this step `DescribeCollection` no longer reports the field.
+2. **Index cascade phase**: `cascadeDropFieldIndexesInline` broadcasts `DropIndex` for each surviving index on the dropped field ID; once those acks complete, `indexMeta` entries are cleared.
+
+**Observable window**: Between phase 1 and phase 2 — typically milliseconds, but bounded only by the `DropIndex` broadcast round-trip — an external observer can see:
+
+- `DescribeCollection` → field is gone
+- `ListIndexes` → an index on the dropped field name is still reported
+
+This state is **transient**, not an orphaned-index bug. It is equivalent to the window that `DropCollection` exposes between deleting the collection meta and the cascade cleanup of its indexes.
+
+**Retry convergence**: `cascadeDropFieldIndexesInline` is driven by the standard broadcast ack-callback framework — if the `DropIndex` broadcast fails (network, rootcoord restart, etc.), the ack infrastructure retries until success, and rootcoord re-drives outstanding callbacks from the broadcast log after restart. Final consistency is guaranteed; the window does not accumulate.
+
+**On-call diagnosis**: to distinguish a transient drop-field cascade window from a true orphaned-index bug:
+
+- RootCoord logs `cascade dropping index on dropped field` with `fieldID`, `indexName`, `indexID` for every cascade target; the presence of a recent entry for the observed index confirms the current state is transient.
+- Re-query after ~30s — if `ListIndexes` still returns the dropped field, the cascade has genuinely failed to converge and should be treated as an orphaned-index bug through the existing runbook.
+
+### 6.4 In-flight Request Semantics
+
+Segcore's schema-driven filtering (§4.6) gates **loading**, not **query plan compilation or execution**. This section specifies how in-flight search / query / groupby requests behave relative to a concurrent drop.
+
+**A request "observes" a dropped field only when it actually references the field**, through any of:
+- `anns_field`
+- `filter` / expression
+- `output_fields` (explicit or via `"*"` expansion)
+- `group_by_field`
+- partition-key expression
+
+Requests that do not reference the dropped field pass through unaffected — plan compilation never looks up the removed field, and the executor never issues a column access for it.
+
+**When a request does reference the dropped field**, one of three outcomes applies, determined by the race between the proxy's `globalMetaCache` invalidation and the querynode's segment reload:
+
+| Case | Proxy cache state | QueryNode segment state | Outcome |
+|------|-------------------|-------------------------|---------|
+| 1. Post-invalidation (common) | new schema (N+1) | any | proxy's `CreateSearchPlanArgs` schema-helper cannot resolve the field; `task_search.go` wraps the error as `ErrParameterInvalid: "failed to create query plan: field not found: <field>"` — returned to the client |
+| 2. Cross-version (narrow) | stale (N) | new schema (N+1), segment reloaded without the field | plan compiles against schema N, reaches querynode; segcore's `chunk_data_impl`/`chunk_array_view_impl` check `field_data_ready_bitset_`, the bit is 0 for the dropped field, `AssertInfo` raises `SegcoreError` — surfaced to the client as an error status |
+| 3. No race | stale or new | still has the field | executes normally |
+
+Cases 1 and 2 both return a clear error to the client; **neither aborts or corrupts state**. Case 2 is bounded in time by the proxy cache invalidation latency (rootcoord broadcast → per-proxy cache invalidate, milliseconds to seconds in practice), and further bounded by the schema-version-consistency gate in §6.1: a second schema mutation cannot begin until the previous one has propagated, so the cross-version window is always tied to a single in-flight mutation and never accumulates.
+
+SDKs cache collection schema in a process-wide `GlobalCache`. `add_collection_field` and `add_collection_function` previously did not invalidate this cache, relying on `@retry_on_schema_mismatch` on `insert_rows` / `upsert_rows` to recover from staleness on the write path.
+
+Introducing drop-field / drop-function surfaces a case this passive model cannot recover from: for bytes-input search, the SDK consults the cache for the `anns_field` vector type to encode the placeholder. After `drop_collection_field` followed by `add_collection_field` re-creating the field with a different type, the stale cache returns the old type, the server rejects the request, and because `search` has no schema-mismatch retry (unlike `insert_rows`), the error persists on every subsequent call.
+
+To close this, all four schema-mutating public methods — `drop_collection_field`, `drop_collection_function`, `add_collection_field` and `add_collection_function` (sync + async) — now invalidate the cache on success, so the next request re-fetches fresh schema from the server.
 
 ---
 

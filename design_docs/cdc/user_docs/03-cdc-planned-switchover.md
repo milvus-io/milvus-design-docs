@@ -41,6 +41,18 @@ Planned switchover guarantees no data loss, but the operation time depends on ho
 Create a full replacement configuration where `cluster-b` becomes the source and `cluster-a` becomes the target.
 
 ```python
+# If you followed the Quick Start, cluster A is the original source cluster,
+# and cluster B is the original target cluster.
+cluster_a_id = source_cluster_id
+cluster_a_addr = source_cluster_addr
+cluster_a_token = source_cluster_token
+cluster_a_pchannels = source_cluster_pchannels
+
+cluster_b_id = target_cluster_id
+cluster_b_addr = target_cluster_addr
+cluster_b_token = target_cluster_token
+cluster_b_pchannels = target_cluster_pchannels
+
 switchover_config = {
     "clusters": [
         {

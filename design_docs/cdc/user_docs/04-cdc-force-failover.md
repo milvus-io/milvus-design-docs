@@ -55,6 +55,12 @@ The most important safety requirement is to prevent split brain. After force fai
 Build a configuration that contains only the standby cluster and no replication topology. Set `force_promote=True`.
 
 ```python
+# If you followed the Quick Start, cluster B is the original target cluster.
+cluster_b_id = target_cluster_id
+cluster_b_addr = target_cluster_addr
+cluster_b_token = target_cluster_token
+cluster_b_pchannels = target_cluster_pchannels
+
 force_failover_config = {
     "clusters": [
         {

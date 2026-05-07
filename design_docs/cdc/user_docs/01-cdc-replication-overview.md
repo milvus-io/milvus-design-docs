@@ -46,8 +46,8 @@ Milvus provides two ways to move service traffic from the primary to a standby c
 
 | Operation | Use when | Data loss | Expected recovery behavior |
 |---|---|---|---|
-| **Planned switchover** | The primary is still reachable, or you are doing maintenance | RPO = 0 | Waits for remaining replicated data before roles change |
-| **Force failover** | The primary is completely unavailable and cannot be recovered quickly | Possible | Promotes the standby immediately so writes can resume |
+| **[Planned switchover](./03-cdc-planned-switchover.md)** | The primary is still reachable, or you are doing maintenance | RPO = 0 | Waits for remaining replicated data before roles change |
+| **[Force failover](./04-cdc-force-failover.md)** | The primary is completely unavailable and cannot be recovered quickly | Possible | Promotes the standby immediately so writes can resume |
 
 Use planned switchover whenever the primary can still respond. Use force failover only when restoring availability is more important than waiting for the original primary.
 
@@ -60,7 +60,7 @@ CDC lag affects failover behavior:
 - During planned switchover, lower CDC lag usually means the switchover completes faster.
 - During force failover, CDC lag represents the data window that may be lost if the original primary is unavailable.
 
-Monitor CDC lag continuously and keep it as low as possible. The Quick Start includes a PromQL example for estimating CDC lag.
+Monitor CDC lag continuously and keep it as low as possible. [CDC Replication Quick Start](./02-cdc-replication-quick-start.md) includes a PromQL example for estimating CDC lag.
 
 ## FAQ
 

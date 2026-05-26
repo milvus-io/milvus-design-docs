@@ -1,5 +1,7 @@
 # Milvus Design Docs
 
+**Deprecated: all docs has been merged into [Milvus design docs](https://github.com/milvus-io/milvus/tree/master/docs/design-docs), new design doc should be submitted new PR at [milvus-io/milvus](https://github.com/milvus-io/milvus)**
+
 This repository contains MEPs (Milvus Enhancement Proposals) - design documents for major features and architectural changes in [Milvus](https://github.com/milvus-io/milvus).
 
 ## Quick Links
